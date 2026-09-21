@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: btc-15m-terminal
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      # Do NOT set LIVE=1 here — UI defaults OFF; Start injects LIVE=1 into worker only.
+      # Add Kalshi secrets in the Render dashboard when ready to trade:
+      # KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY
