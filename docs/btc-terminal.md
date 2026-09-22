@@ -1,6 +1,6 @@
 # BTC 15m Dual-Mode Terminal (`python -m omega.btc_terminal`)
 
-Kalshi **KXBTC15M** only. Stake ~$1 IOC, one open position max, Exchange 2 cash.
+Kalshi **KXBTC15M** only. Stake ~$0.50 IOC, one open position max, Exchange 2 cash.
 **HARD LOCK:** never deposit / withdraw / bank.
 
 Default is **OFF**. `start` is the only path that runs the trading loop, and it
@@ -81,7 +81,7 @@ Confirm window after market open (all Kalshi crypto 15m with Binance map; skip m
 |------------|--------|-------|
 | **UP** | Follow → buy **YES** | spot **>** VWAP120m; ask **≤ 0.70** |
 | **DOWN** | Follow → buy **NO** | spot **&lt;** VWAP120m; ask **≤ 0.70** |
-| **MIXED / SIDEWAYS** | **Skip** (log `skip MIXED`) | no fade |
+| **MIXED / SIDEWAYS** | **Skip** (log `skip MIXED; slow filter EMA21/50 + min EMA3/9 gap`) | no fade |
 
 - **Trailing exit** (replaces fixed TP +0.20):
   - Track **peak bid** since entry (capped at **0.99**)

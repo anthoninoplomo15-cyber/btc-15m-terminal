@@ -177,3 +177,56 @@ def test_refresh_mode2_series_crypto_only(monkeypatch):
     assert got == ("KXBTC15M", "KXETH15M", "KXXRP15M", "KXDOGE15M")
     assert btc_terminal.MAX_OPEN == 1
     assert "KXGOLD15M" not in got
+
+
+def test_mode2_slow_filter_and_midcut_reason():
+    from omega.btc_trend import mode2_slow_filter_ok, mode2_bias_adverse_to_side, MODE2_MIN_EMA_GAP
+
+    assert btc_terminal.STAKE == 0.50
+    assert btc_terminal.MIDCUT_ADVERSE_BID == 0.15
+    assert MODE2_MIN_EMA_GAP > 0
+
+    # Strong UP + EMA21>EMA50 → OK
+    up = {"bias": "UP", "ema3": 110.0, "ema9": 100.0, "ema21": 105.0, "ema50": 100.0}
+    ok, msg = mode2_slow_filter_ok(up, "UP")
+    assert ok, msg
+
+    # Fast UP but slow DOWN → reject
+    conflict = {"bias": "UP", "ema3": 110.0, "ema9": 100.0, "ema21": 99.0, "ema50": 100.0}
+    ok, msg = mode2_slow_filter_ok(conflict, "UP")
+    assert not ok and "EMA21/50" in msg
+
+    # Gap too small → reject
+    tiny = {"bias": "UP", "ema3": 100.03, "ema9": 100.0, "ema21": 101.0, "ema50": 100.0}
+    ok, msg = mode2_slow_filter_ok(tiny, "UP")
+    assert not ok and "ema_gap" in msg
+
+    assert mode2_bias_adverse_to_side("MIXED", "yes")
+    assert mode2_bias_adverse_to_side("DOWN", "yes")
+    assert not mode2_bias_adverse_to_side("UP", "yes")
+    assert mode2_bias_adverse_to_side("UP", "no")
+    assert not mode2_bias_adverse_to_side("DOWN", "no")
+
+    # Weak progress alone at 7.5m with aligned bias → NO midcut
+    r = btc_terminal.mode2_midcut_reason(
+        trail_armed=False, age=450, entry=0.50, bid=0.52, side="yes", bias="UP"
+    )
+    assert r is None
+
+    # Bias flipped → midcut
+    r = btc_terminal.mode2_midcut_reason(
+        trail_armed=False, age=450, entry=0.50, bid=0.52, side="yes", bias="DOWN"
+    )
+    assert r and "bias_against" in r
+
+    # Deep adverse even if bias still UP → midcut
+    r = btc_terminal.mode2_midcut_reason(
+        trail_armed=False, age=450, entry=0.50, bid=0.30, side="yes", bias="UP"
+    )
+    assert r and "deep_adverse" in r
+
+    # Trail armed → never midcut via this helper
+    r = btc_terminal.mode2_midcut_reason(
+        trail_armed=True, age=500, entry=0.50, bid=0.20, side="yes", bias="MIXED"
+    )
+    assert r is None

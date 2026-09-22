@@ -8,8 +8,9 @@ Modes:
                   EMA3/9 direction per market:
                   UP→YES follow (spot>VWAP120m), DOWN→NO follow (spot<VWAP120m);
                   MIXED/SIDEWAYS → skip; ask>0.70 → skip;
+                  slow filter: min |EMA3−EMA9|/EMA9 + EMA21/50 same side;
                 trailing exit (arm +0.10 peak, stop −0.08 from peak, cap 0.99);
-                midcut at ~7.5m if trail never armed and bid<entry+0.05;
+                midcut at ~7.5m if trail never armed AND (bias against OR bid≤entry−0.15);
                 max 3 TP/MIDCUT sell attempts then abandon.
                 Max 1 concurrent open across all series (still scan all).
                 Same-cycle: pick ONLY the single best by combined score
@@ -23,7 +24,7 @@ CLI (user activates manually; default is OFF / status only):
   LIVE=1 python -m omega.btc_terminal start --mode fade
   python -m omega.btc_terminal stop
 
-HARD LOCK: never deposit/withdraw/bank. Ex2 cash only. Stake ~$1.
+HARD LOCK: never deposit/withdraw/bank. Ex2 cash only. Stake ~$0.50.
 Without LIVE=1, start refuses. Default / no args: status+trend and EXIT (no loop).
 """
 
@@ -45,7 +46,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from omega import config
-from omega.btc_trend import asset_label, detect_trend, format_trend_block, mode2_side_from_trend, mode2_vwap_aligned
+from omega.btc_trend import (
+    asset_label,
+    detect_trend,
+    format_trend_block,
+    mode2_bias_adverse_to_side,
+    mode2_side_from_trend,
+    mode2_slow_filter_ok,
+    mode2_vwap_aligned,
+)
 from omega.fetch import INTERVAL_SECONDS, fetch_market, mode2_crypto_series, seconds_remaining, _kalshi_get
 from omega.kalshi import (
     ForbiddenEndpoint,
@@ -89,7 +98,7 @@ DOCS_PATH = Path(
     os.environ.get("DOCS_PATH", str(_PKG_ROOT / "docs" / "btc-terminal.md"))
 ).expanduser().resolve()
 
-STAKE = 1.00
+STAKE = 0.50
 MAX_OPEN_PER_SERIES = 1
 MAX_OPEN = 1  # Mode2: max 1 concurrent open across BTC+ETH+SOL
 
@@ -119,7 +128,8 @@ TRAIL_ARM_ADD = 0.10  # arm trailing once peak bid >= entry + 0.10
 TRAIL_DRAWDOWN = 0.08  # exit when bid falls >= 0.08 from peak high
 MODE2_ASK_MAX = 0.70  # skip FOLLOW if chosen ask above this
 MIDCUT_AGE_SEC = 450  # ~7.5 min halfway into 15m window
-MIDCUT_PROGRESS_ADD = 0.05  # MIDCUT only if trail never armed and bid < entry+0.05
+MIDCUT_PROGRESS_ADD = 0.05  # legacy; no longer a MIDCUT trigger alone
+MIDCUT_ADVERSE_BID = 0.15  # MIDCUT if bid <= entry − 0.15 (deep adverse)
 MAX_MIDCUT_ATTEMPTS = 3
 POLL_SEC = 2.0
 OPEN_POLL_SEC = 0.25
@@ -963,6 +973,49 @@ def exchange_series_open(series: str) -> bool | None:
         return None
 
 
+def mode2_midcut_reason(
+    *,
+    trail_armed: bool,
+    age: float | None,
+    entry: float,
+    bid: float,
+    side: str | None,
+    bias: str | None,
+) -> str | None:
+    """Return MIDCUT reason string if exit should fire, else None.
+
+    Requires: trail never armed, age≥MIDCUT_AGE_SEC, and either
+    (a) EMA3/9 bias flipped against position / MIXED, or
+    (b) bid deeply adverse (bid ≤ entry − MIDCUT_ADVERSE_BID).
+    Weak underperformance (bid < entry+0.05) alone is NOT enough — hold.
+    """
+    if trail_armed:
+        return None
+    if age is None or age < float(MIDCUT_AGE_SEC):
+        return None
+    try:
+        entry_f = float(entry)
+        bid_f = float(bid)
+    except (TypeError, ValueError):
+        return None
+    adverse_floor = entry_f - float(MIDCUT_ADVERSE_BID)
+    deep = bid_f <= adverse_floor + 1e-9
+    flipped = mode2_bias_adverse_to_side(bias, side)
+    if deep and flipped:
+        return (
+            f"bias_against+deep_adverse bias={bias} side={side} "
+            f"bid={bid_f:.4f}<=entry-{MIDCUT_ADVERSE_BID:.2f}={adverse_floor:.4f}"
+        )
+    if deep:
+        return (
+            f"deep_adverse bid={bid_f:.4f}<=entry-{MIDCUT_ADVERSE_BID:.2f}={adverse_floor:.4f}"
+        )
+    if flipped:
+        return f"bias_against bias={bias} side={side} (hold was weak-progress-only)"
+    return None
+
+
+
 def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
     """Manage a single open position for `series` (trail / MIDCUT / settle)."""
     series = str(series).upper()
@@ -1011,7 +1064,8 @@ def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
 
     # Mode 2: trailing exit (replaces fixed TP entry+0.20)
     # Track peak bid since entry; arm after peak >= entry+0.10; exit on -0.08 from peak.
-    # Cap peak/sells at TP_CAP (0.99). MIDCUT@7.5m only if trail never armed & bid<entry+0.05.
+    # Cap peak/sells at TP_CAP (0.99). MIDCUT@7.5m if trail never armed &
+    # (EMA3/9 bias against position/MIXED OR bid <= entry-0.15). Weak progress alone → hold.
     entry = float(pos.get("entry_price") or 0)
     bid_f = min(TP_CAP, float(bid))
     peak = float(pos.get("peak_bid") or entry)
@@ -1082,20 +1136,39 @@ def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
     set_series_position(state, series, pos)
     save_state(state)
 
-    # Mode 2 MIDCUT: ~7.5m, trailing never armed, bid not progressing (< entry+0.05)
+    # Mode 2 MIDCUT: ~7.5m, trail never armed, AND (bias against/MIXED OR deep adverse bid)
     if pos.get("exit_abandoned"):
         return
     age = window_age_sec(pos.get("close_time"))
-    if age is None or age < MIDCUT_AGE_SEC:
+    # Refresh EMA3/9 bias for adverse check (fail-closed → MIXED = adverse to either side)
+    try:
+        live_trend = detect_trend(series=series)
+        live_bias = str((live_trend or {}).get("bias") or "MIXED").upper()
+    except Exception as exc:
+        live_bias = "MIXED"
+        LOGGER.warning("MIDCUT trend refresh failed %s: %s — treat as MIXED", series, type(exc).__name__)
+    reason = mode2_midcut_reason(
+        trail_armed=trail_armed,
+        age=age,
+        entry=entry,
+        bid=bid_f,
+        side=pos.get("side"),
+        bias=live_bias,
+    )
+    if not reason:
+        if age is not None and age >= MIDCUT_AGE_SEC and not trail_armed:
+            LOGGER.info(
+                "MIDCUT hold %s age=%.0fs bid=%.4f entry=%.4f bias=%s side=%s "
+                "(need bias-against or bid<=entry-%.2f; weak progress alone keeps holding)",
+                pos["ticker"], age, bid_f, entry, live_bias, pos.get("side"),
+                MIDCUT_ADVERSE_BID,
+            )
         return
-    progress_floor = entry + MIDCUT_PROGRESS_ADD
-    if bid_f + 1e-9 >= progress_floor:
-        return  # some progress — hold (trail may still arm later)
     attempts = int(pos.get("midcut_attempts") or 0)
     if attempts >= MAX_MIDCUT_ATTEMPTS:
         LOGGER.warning(
-            "MIDCUT abandon %s after %s attempts — hold to settle age=%.0fs bid=%.4f entry=%.4f",
-            pos["ticker"], attempts, age, bid_f, entry,
+            "MIDCUT abandon %s after %s attempts — hold to settle age=%.0fs bid=%.4f entry=%.4f reason=%s",
+            pos["ticker"], attempts, age, bid_f, entry, reason,
         )
         pos["exit_abandoned"] = True
         stats = state.setdefault("stats", {})
@@ -1104,8 +1177,8 @@ def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
         save_state(state)
         return
     LOGGER.info(
-        "MIDCUT %s age=%.0fs bid=%.4f entry=%.4f peak=%.4f trail_armed=%s progress_floor=%.4f attempt=%s/%s",
-        pos["ticker"], age, bid_f, entry, peak, trail_armed, progress_floor,
+        "MIDCUT %s age=%.0fs bid=%.4f entry=%.4f peak=%.4f trail_armed=%s bias=%s reason=%s attempt=%s/%s",
+        pos["ticker"], age, bid_f, entry, peak, trail_armed, live_bias, reason,
         attempts + 1, MAX_MIDCUT_ATTEMPTS,
     )
     ok = close_sell(pos, bid_f, aggressive=True)
@@ -1270,6 +1343,10 @@ def evaluate_mode2_candidate(
     if bias in {"MIXED", "SIDEWAYS"}:
         return None
 
+    slow_ok, slow_msg = mode2_slow_filter_ok(trend, bias)
+    if not slow_ok:
+        return None
+
     allowed, _bound, age_path = mode2_entry_allowed(age, need_prior=False, prior_ok=True)
     if not allowed:
         return None
@@ -1308,6 +1385,7 @@ def evaluate_mode2_candidate(
         "age_path": age_path,
         "src": src,
         "vwap_msg": vwap_msg,
+        "slow_msg": slow_msg,
         "close_time": close_time,
     }
 
@@ -1358,6 +1436,12 @@ def try_enter_fade(
             "skip MIXED | %s age=%.0fs ticker=%s", label_asset, age, market["ticker"]
         )
         return f"skip MIXED ({series})"
+
+    # Slow bias filter: min EMA3/9 gap + EMA21/50 same side
+    slow_ok, slow_msg = mode2_slow_filter_ok(trend, bias)
+    if not slow_ok:
+        LOGGER.info("%s | %s | %s", label_asset, slow_msg, market["ticker"])
+        return f"{slow_msg} ({series})"
 
     # Confirm window [60, 120]s; listing-lag catch-up retargeted to same window.
     allowed, bound_age, age_path = mode2_entry_allowed(
@@ -1420,6 +1504,10 @@ def try_enter_fade(
         LOGGER.info("%s | %s | %s", label, label_asset, vwap_msg)
         return f"{vwap_msg} ({series})"
     LOGGER.info("%s | %s | %s", label, label_asset, vwap_msg)
+    slow_ok2, slow_msg2 = mode2_slow_filter_ok(trend, bias)
+    LOGGER.info("%s | %s | %s", label_asset, slow_msg2 if slow_ok2 else slow_msg2, market["ticker"])
+    if not slow_ok2:
+        return f"{slow_msg2} ({series})"
 
     ex = exchange_series_open(series)
     if ex is True:
@@ -1542,7 +1630,7 @@ def write_status(
         "",
         f"- Markets ({len(MODE2_SERIES)} crypto): " + ",".join(MODE2_SERIES),
         "- UP → FOLLOW YES (spot>VWAP120m) · DOWN → FOLLOW NO (spot<VWAP120m) · MIXED → skip",
-        "- EMA3/9 picks FOLLOW side; VWAP + ask≤0.70 gate entries; MIXED skipped",
+        "- EMA3/9 picks FOLLOW side; EMA21/50 + min gap + VWAP + ask≤0.70 gate entries; MIXED skipped",
         "- Confirm window age∈[60,120]s (no exact-open ≤20s); listing-lag ok inside window",
         "- Trailing exit: arm when peak≥entry+0.10; exit when bid≤peak−0.08; sell cap 0.99; no fixed TP+0.20",
         "- Max 1 concurrent open; same-cycle pick=ONLY best score "
@@ -1585,8 +1673,8 @@ def write_status(
         "## Rules (short)",
         "",
         "- Mode 1 first_phase (BTC): rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
-        "- Mode 2 FOLLOW (all Binance crypto 15m): confirm age∈[60,120]s; VWAP align; ask≤0.70; trail arm+10¢ stop−8¢ from peak (cap 0.99); MIDCUT@7.5m if trail never armed & bid<entry+0.05; max 3 tries",
-        "- Stake ~$1 IOC; max 1 concurrent; best-score pick; Ex2 cash; NEVER deposit/withdraw/bank",
+        "- Mode 2 FOLLOW (all Binance crypto 15m): confirm age∈[60,120]s; VWAP align; slow EMA21/50+min gap; ask≤0.70; trail arm+10¢ stop−8¢ from peak (cap 0.99); MIDCUT@7.5m if trail never armed AND (bias against/MIXED OR bid≤entry−0.15); max 3 tries",
+        "- Stake ~$0.50 IOC; max 1 concurrent; best-score pick; Ex2 cash; NEVER deposit/withdraw/bank",
         "",
         "## Stats",
         "",
@@ -1790,20 +1878,23 @@ def run_loop(mode: str) -> None:
     LOGGER.info(
         "Multi-asset terminal LIVE start mode=%s series=%s stake~$%.2f max_open=%s. "
         "Mode2 rules per market: confirm age∈[%ss,%ss], UP→YES/DOWN→NO FOLLOW+VWAP120m, "
-        "skip MIXED, ask≤0.70, TRAIL arm+0.10/dd-0.08 (cap 0.99, no fixed TP+0.20), "
-        "MIDCUT@7.5m if trail never armed & bid<entry+0.05, max 3 tries. "
+        "skip MIXED, slow-filter min|EMA3-EMA9|/EMA9 + EMA21/50 same side, ask≤0.70, "
+        "TRAIL arm+0.10/dd-0.08 (cap 0.99, no fixed TP+0.20), "
+        "MIDCUT@7.5m if trail never armed AND (bias against/MIXED OR bid≤entry-0.15); "
+        "weak bid<entry+0.05 alone → HOLD. Max 3 tries. "
         "Max1 concurrent; same-cycle pick=ONLY best score "
         "(1000*ema_gap + 500*vwap_strength + ask_edge). "
-        "Mode1: rem(50,70] any≥1¢ (BTC only). Cash-gated; no deposits.",
+        "Mode1: rem(50,70] any≥1¢ (BTC only). Cash-gated; no deposits/bank.",
         mode, ",".join(series_list), STAKE, MAX_OPEN if mode == "fade" else 1,
         ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
     )
     LOGGER.info(
         "Mode2 crypto universe (%s): %s | score=1000*ema_gap+500*vwap_rel+ask_edge | "
-        "max_concurrent_open=%s confirm_window=%s–%ss trail=arm+%.2f/dd-%.2f",
+        "max_concurrent_open=%s confirm_window=%s–%ss trail=arm+%.2f/dd-%.2f "
+        "midcut=bias_against|bid<=entry-%.2f slow=EMA21/50+min_gap",
         len(series_list), ",".join(series_list),
         MAX_OPEN, ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
-        TRAIL_ARM_ADD, TRAIL_DRAWDOWN,
+        TRAIL_ARM_ADD, TRAIL_DRAWDOWN, MIDCUT_ADVERSE_BID,
     )
 
     def _on_sig(_signum, _frame):

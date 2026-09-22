@@ -8,7 +8,7 @@ Clicking **Start** in the UI spawns a worker with `LIVE=1`. Without Kalshi keys,
 ## Hard locks
 
 - Never deposit / withdraw / bank (Kalshi path allowlist in `omega/kalshi.py`).
-- Stake ~$1 IOC, one open position max, Exchange 2 cash.
+- Stake ~$0.50 IOC, one open position max, Exchange 2 cash.
 - Do **not** commit secrets (`.env`, `*.pem`, `private.key`, `/home/box/.kalshi/`).
 
 ## Modes
