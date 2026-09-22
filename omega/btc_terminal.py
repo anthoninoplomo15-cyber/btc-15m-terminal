@@ -195,6 +195,31 @@ def _opp(price):
         return None
 
 
+def _active_interval_markets(markets: list[dict], now: datetime | None = None) -> list[dict]:
+    """Return only intervals active *now*, newest open first.
+
+    Kalshi can leave a just-closed market at status=open briefly.  Treat local
+    close/open times as authoritative so that stale rows cannot hide the new
+    15-minute interval.  Sorting by remaining time closest to a full interval
+    selects the newly opened contract when responses overlap at the boundary.
+    """
+    now = now or utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    active = []
+    for market in markets:
+        close_dt = _parse_iso(market.get("close_time"))
+        if close_dt is None:
+            continue
+        rem = (close_dt - now).total_seconds()
+        age = INTERVAL_SECONDS - rem
+        if rem <= 0 or age < 0 or age > INTERVAL_SECONDS:
+            continue
+        active.append((abs(rem - INTERVAL_SECONDS), close_dt, market))
+    active.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in active]
+
+
 def list_open_btc() -> list[dict]:
     payload = _kalshi_get(
         "/markets",
@@ -223,8 +248,7 @@ def list_open_btc() -> list[dict]:
                 "floor_strike": m.get("floor_strike"),
             }
         )
-    markets.sort(key=lambda x: x.get("close_time") or "")
-    return markets
+    return _active_interval_markets(markets)
 
 
 def list_recent_settled(limit: int = 8) -> list[dict]:
@@ -704,8 +728,13 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
     close_time = str(market.get("close_time") or "")
     age = window_age_sec(close_time)
     rem = seconds_remaining(close_time)
-    if age is None:
+    if age is None or rem is None:
         return "bad close_time"
+    if rem <= 0 or age < 0 or age > INTERVAL_SECONDS:
+        return (
+            f"no current active interval age={age:.0f}s rem={rem:.0f}s "
+            f"on {market['ticker']}"
+        )
     traded = set(state.get("traded_close_times") or [])
     if close_time in traded:
         return f"already traded this interval {market['ticker']}"
@@ -1104,6 +1133,10 @@ def run_loop(mode: str) -> None:
                         else:
                             if rem is not None and FP_REM_LO < rem <= FP_REM_HI + 15:
                                 sleep_for = FP_POLL_SEC
+                    elif mode == "fade":
+                        # During Kalshi's close/open transition, retry rapidly
+                        # until the next active interval appears.
+                        sleep_for = OPEN_POLL_SEC
                 except Exception:
                     if mode == "fade":
                         sleep_for = OPEN_POLL_SEC
