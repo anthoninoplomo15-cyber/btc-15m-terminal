@@ -64,8 +64,12 @@ Advice vs a prospective side (when known): **ALIGNED** / **CONFLICT** / **CAUTIO
 
 Exact open of new interval:
 
-- Age ≤ **20s** after open
+- Age ≤ **20s** after open (normal)
 - Settle-lag grace ≤ **45s** only when bias is MIXED and prior result not ready yet
+- **Transition catch-up:** if we observed empty open list or rem≤0 within the last **90s**,
+  allow first appearance up to age ≤ **60s** (Kalshi listing lag). In-memory flag; cleared on restart.
+- Near :00/:15/:30/:45 (±30s) keep **0.25s** poll even when open list is empty
+- Optional: construct next `KXBTC15M-…` ticker from clock and `fetch_market` when list is empty
 
 **Direction (FINAL — trend does NOT block entries):**
 

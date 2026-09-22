@@ -78,13 +78,24 @@ FP_ANY_GAIN = 0.01  # ~1¢ net after fees
 # Mode 2 — fade / follow
 ENTRY_MAX_AGE_SEC = 20
 ENTRY_SETTLE_GRACE_SEC = 45
+ENTRY_CATCHUP_MAX_AGE_SEC = 60  # listing-lag catch-up after empty/rem<=0
+TRANSITION_CATCHUP_LOOKBACK_SEC = 90
 TP_ADD = 0.20  # +20 cents from entry
 TP_CAP = 0.99
 MAX_TP_ATTEMPTS = 3
 POLL_SEC = 2.0
 OPEN_POLL_SEC = 0.25
-NEAR_OPEN_SEC = 30
+NEAR_OPEN_SEC = 30  # also ±30s of :00/:15/:30/:45 clock boundary
 FP_POLL_SEC = 1.0
+
+# Month codes for KXBTC15M-{YY}{MON}{DD}{HH}{MM}-{MM} ticker construction
+_MONTH_CODES = (
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+)
+
+# In-memory only (cleared on restart): last time we saw empty open list or rem<=0
+_last_transition_obs_mono: float | None = None
 
 MODES = ("first_phase", "fade")
 
@@ -277,6 +288,127 @@ def window_age_sec(close_time) -> float | None:
         return None
     open_dt = close_dt - timedelta(seconds=INTERVAL_SECONDS)
     return (utc_now() - open_dt).total_seconds()
+
+
+def mark_transition_obs() -> None:
+    """Record that we saw empty open list or rem<=0 (listing rollover)."""
+    global _last_transition_obs_mono
+    _last_transition_obs_mono = time.monotonic()
+
+
+def transition_catchup_active(lookback: float = TRANSITION_CATCHUP_LOOKBACK_SEC) -> bool:
+    """True if empty/rem<=0 was observed within lookback seconds (this process)."""
+    if _last_transition_obs_mono is None:
+        return False
+    return (time.monotonic() - _last_transition_obs_mono) <= lookback
+
+
+def near_interval_boundary(
+    now: datetime | None = None, window: float = NEAR_OPEN_SEC
+) -> bool:
+    """True within ±window seconds of a :00/:15/:30/:45 ET mark."""
+    now = now or et_now()
+    secs = now.minute % 15 * 60 + now.second + now.microsecond / 1_000_000
+    return secs <= window or secs >= (INTERVAL_SECONDS - window)
+
+
+def current_interval_close_et(now: datetime | None = None) -> datetime:
+    """Close time (ET) of the 15m interval containing *now* (open+15m)."""
+    now = now or et_now()
+    open_min = (now.minute // 15) * 15
+    open_dt = now.replace(minute=open_min, second=0, microsecond=0)
+    return open_dt + timedelta(minutes=15)
+
+
+def kxbtc15m_ticker_for_close(close_et: datetime) -> str:
+    """Build KXBTC15M-{YY}{MON}{DD}{HH}{MM}-{MM} from an ET close datetime."""
+    if close_et.tzinfo is None:
+        close_et = close_et.replace(tzinfo=ET)
+    else:
+        close_et = close_et.astimezone(ET)
+    yy = close_et.strftime("%y")
+    mon = _MONTH_CODES[close_et.month - 1]
+    dd = f"{close_et.day:02d}"
+    hh = f"{close_et.hour:02d}"
+    mm = f"{close_et.minute:02d}"
+    return f"{SERIES}-{yy}{mon}{dd}{hh}{mm}-{mm}"
+
+
+def fetch_market_by_clock() -> dict | None:
+    """Construct current-interval ticker from clock and fetch_market (bypass open list)."""
+    close_et = current_interval_close_et()
+    ticker = kxbtc15m_ticker_for_close(close_et)
+    try:
+        raw = fetch_market(ticker)
+    except Exception as exc:
+        LOGGER.debug("fetch_market_by_clock %s failed: %s", ticker, exc)
+        return None
+    if not raw or not raw.get("ticker"):
+        return None
+    status = str(raw.get("status") or "").lower()
+    if status not in {"open", "active", ""}:
+        return None
+    # Normalize to list_open_btc shape
+    yes_bid = raw.get("yes_bid")
+    yes_ask = raw.get("yes_ask")
+    return {
+        "ticker": raw["ticker"],
+        "series": SERIES,
+        "title": raw.get("title"),
+        "close_time": raw.get("close_time"),
+        "status": raw.get("status"),
+        "result": raw.get("result"),
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "no_bid": _opp(yes_ask),
+        "no_ask": _opp(yes_bid),
+        "floor_strike": raw.get("floor_strike"),
+    }
+
+
+def resolve_fade_market() -> tuple[dict | None, str]:
+    """Pick Mode2 market: open list first; on empty/rollover try clock ticker.
+
+    Marks transition observation when list is empty or selected market has rem<=0.
+    """
+    opens = list_open_btc()
+    if opens:
+        market = opens[0]
+        rem = seconds_remaining(market.get("close_time"))
+        if rem is not None and rem <= 0:
+            mark_transition_obs()
+            # Stale row at boundary — try clock construct for the new interval
+            clock_m = fetch_market_by_clock()
+            if clock_m:
+                return clock_m, "clock_after_stale"
+            return None, "stale_rem_le_0"
+        return market, "open_list"
+
+    mark_transition_obs()
+    clock_m = fetch_market_by_clock()
+    if clock_m:
+        return clock_m, "clock_after_empty"
+    return None, "empty"
+
+
+def mode2_entry_allowed(age: float, *, need_prior: bool, prior_ok: bool) -> tuple[bool, float, str]:
+    """Decide if Mode2 may enter given market age.
+
+    - age <= ENTRY_MAX_AGE_SEC (20): always (normal exact-open)
+    - need_prior and not prior_ok: up to ENTRY_SETTLE_GRACE_SEC (45)
+    - 20 < age <= ENTRY_CATCHUP_MAX_AGE_SEC (60): only with transition catch-up flag
+    """
+    if age <= ENTRY_MAX_AGE_SEC:
+        return True, float(ENTRY_MAX_AGE_SEC), "normal"
+    if need_prior and not prior_ok and age <= ENTRY_SETTLE_GRACE_SEC:
+        return True, float(ENTRY_SETTLE_GRACE_SEC), "settle_grace"
+    if age <= ENTRY_CATCHUP_MAX_AGE_SEC and transition_catchup_active():
+        return True, float(ENTRY_CATCHUP_MAX_AGE_SEC), "transition_catchup"
+    # Report the effective ceiling that blocked us
+    max_age = float(ENTRY_MAX_AGE_SEC)
+    if need_prior and not prior_ok:
+        max_age = float(ENTRY_SETTLE_GRACE_SEC)
+    return False, max_age, "blocked"
 
 
 def prior_settle_for(close_time: str, settled: list[dict]) -> dict | None:
@@ -721,16 +853,16 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
     """Mode 2: exact-open; direction from trend (FOLLOW or FADE prior)."""
     if state.get("position"):
         return "already in position"
-    opens = list_open_btc()
-    if not opens:
+    market, src = resolve_fade_market()
+    if not market:
         return "no open KXBTC15M market"
-    market = opens[0]
     close_time = str(market.get("close_time") or "")
     age = window_age_sec(close_time)
     rem = seconds_remaining(close_time)
     if age is None or rem is None:
         return "bad close_time"
     if rem <= 0 or age < 0 or age > INTERVAL_SECONDS:
+        mark_transition_obs()
         return (
             f"no current active interval age={age:.0f}s rem={rem:.0f}s "
             f"on {market['ticker']}"
@@ -744,14 +876,14 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
     prior_ok = bool(prior and prior.get("result") in {"yes", "no"})
     bias = str(trend.get("bias") or "MIXED").upper()
 
-    # Exact-open window; grace only if need prior for MIXED fade path
+    # Exact-open (≤20s); settle grace (≤45 MIXED); transition catch-up (≤60)
     need_prior = bias == "MIXED"
-    max_age = ENTRY_MAX_AGE_SEC
-    if need_prior and not prior_ok:
-        max_age = ENTRY_SETTLE_GRACE_SEC
-    if age > max_age:
+    allowed, max_age, age_path = mode2_entry_allowed(
+        age, need_prior=need_prior, prior_ok=prior_ok
+    )
+    if not allowed:
         return (
-            f"waiting for next open (age={age:.0f}s > {max_age}s, "
+            f"waiting for next open (age={age:.0f}s > {max_age:.0f}s, "
             f"rem={None if rem is None else round(rem)}s) on {market['ticker']}"
         )
     if age < -2:
@@ -760,6 +892,13 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
         return (
             f"at open MIXED but prior settle not ready age={age:.0f}s "
             f"on {market['ticker']} (retrying)"
+        )
+    if age_path == "transition_catchup":
+        LOGGER.info(
+            "Mode2 transition catch-up age=%.0fs src=%s ticker=%s",
+            age,
+            src,
+            market["ticker"],
         )
 
     if prior_ok:
@@ -1121,12 +1260,28 @@ def run_loop(mode: str) -> None:
                 else:
                     note = "balance unavailable"
                 try:
+                    # Clock boundary (±30s of :00/:15/:30/:45) always fast-poll
+                    # Mode2 — even when list_open is empty during Kalshi rollover.
+                    if mode == "fade" and near_interval_boundary():
+                        sleep_for = OPEN_POLL_SEC
                     opens = list_open_btc()
-                    if opens:
+                    if not opens and mode == "fade":
+                        mark_transition_obs()
+                        sleep_for = OPEN_POLL_SEC
+                    elif opens:
                         age = window_age_sec(opens[0].get("close_time"))
                         rem = seconds_remaining(opens[0].get("close_time"))
+                        if rem is not None and rem <= 0 and mode == "fade":
+                            mark_transition_obs()
+                            sleep_for = OPEN_POLL_SEC
                         if mode == "fade":
                             if age is not None and age <= ENTRY_SETTLE_GRACE_SEC:
+                                sleep_for = OPEN_POLL_SEC
+                            elif (
+                                age is not None
+                                and age <= ENTRY_CATCHUP_MAX_AGE_SEC
+                                and transition_catchup_active()
+                            ):
                                 sleep_for = OPEN_POLL_SEC
                             elif rem is not None and rem <= NEAR_OPEN_SEC:
                                 sleep_for = OPEN_POLL_SEC
@@ -1134,12 +1289,11 @@ def run_loop(mode: str) -> None:
                             if rem is not None and FP_REM_LO < rem <= FP_REM_HI + 15:
                                 sleep_for = FP_POLL_SEC
                     elif mode == "fade":
-                        # During Kalshi's close/open transition, retry rapidly
-                        # until the next active interval appears.
                         sleep_for = OPEN_POLL_SEC
                 except Exception:
                     if mode == "fade":
                         sleep_for = OPEN_POLL_SEC
+                        mark_transition_obs()
             else:
                 pos = state["position"]
                 note = (
