@@ -3,12 +3,16 @@
 Modes:
   first_phase — BTC-only; enter last ~1 min (rem in (50,70]), side from trend + cheap ask;
                 exit any ~≥1¢ net after fees, else hold to settle.
-  fade (Mode2)— multi-series BTC+ETH+SOL; exact-open entry; EMA3/9 direction per market:
+  fade (Mode2)— multi-series BTC+ETH+SOL; confirm-window entry (age 60–120s);
+                  EMA3/9 direction per market:
                   UP→YES follow (spot>VWAP120m), DOWN→NO follow (spot<VWAP120m);
                   MIXED/SIDEWAYS → skip; ask>0.70 → skip;
-                TP = entry+0.20 capped 0.99; midcut at ~7.5m if not progressing;
+                trailing exit (arm +0.10 peak, stop −0.08 from peak, cap 0.99);
+                midcut at ~7.5m if trail never armed and bid<entry+0.05;
                 max 3 TP/MIDCUT sell attempts then abandon.
-                Up to one open position per series (3 concurrent max). Cash-gated.
+                Max 1 concurrent open across BTC+ETH+SOL (still scan all three).
+                Same-cycle multi-qualify → clearest EMA gap, then BTC→ETH→SOL.
+                Cash-gated.
 
 CLI (user activates manually; default is OFF / status only):
   python -m omega.btc_terminal status
@@ -71,7 +75,7 @@ DOCS_PATH = Path(
 
 STAKE = 1.00
 MAX_OPEN_PER_SERIES = 1
-MAX_OPEN = 3  # Mode2: one per series across BTC/ETH/SOL
+MAX_OPEN = 1  # Mode2: max 1 concurrent open across BTC+ETH+SOL
 
 # Mode 1 — first_phase
 FP_REM_LO = 50.0  # exclusive lower
@@ -82,16 +86,24 @@ FP_MIXED_ASK_CAP = 0.85
 FP_ANY_GAIN = 0.01  # ~1¢ net after fees
 
 # Mode 2 — fade / follow
-ENTRY_MAX_AGE_SEC = 20
-ENTRY_SETTLE_GRACE_SEC = 45  # legacy; MIXED no longer enters
-ENTRY_CATCHUP_MAX_AGE_SEC = 60  # listing-lag catch-up after empty/rem<=0
+# Confirm window: enter only when market age ∈ [60, 120] seconds (NOT exact-open ≤20s).
+ENTRY_CONFIRM_MIN_AGE_SEC = 60
+ENTRY_CONFIRM_MAX_AGE_SEC = 120
+# Listing-lag catch-up retargeted to the same confirm window (late appear still ok if age≤120).
+ENTRY_CATCHUP_MAX_AGE_SEC = ENTRY_CONFIRM_MAX_AGE_SEC
+ENTRY_SETTLE_GRACE_SEC = 45  # legacy unused for Mode2 entries (MIXED skipped)
 TRANSITION_CATCHUP_LOOKBACK_SEC = 90
-TP_ADD = 0.20  # +20 cents from entry
-TP_CAP = 0.99
-MAX_TP_ATTEMPTS = 3
-MODE2_ASK_MAX = 0.70  # skip FOLLOW if chosen ask above this (harder to hit +20¢)
+# Back-compat alias: old "exact-open" ceiling removed; tests/docs use confirm bounds.
+ENTRY_MAX_AGE_SEC = ENTRY_CONFIRM_MIN_AGE_SEC
+# Legacy fixed TP (+0.20) disabled for Mode2 — trailing exit instead.
+TP_ADD = 0.20  # unused for Mode2; kept for back-compat / first_phase helpers
+TP_CAP = 0.99  # cap peak tracking and sell prices
+MAX_TP_ATTEMPTS = 3  # reused as max trailing sell attempts
+TRAIL_ARM_ADD = 0.10  # arm trailing once peak bid >= entry + 0.10
+TRAIL_DRAWDOWN = 0.08  # exit when bid falls >= 0.08 from peak high
+MODE2_ASK_MAX = 0.70  # skip FOLLOW if chosen ask above this
 MIDCUT_AGE_SEC = 450  # ~7.5 min halfway into 15m window
-MIDCUT_PROGRESS_ADD = 0.05  # bid must reach entry+0.05 to count as progressing
+MIDCUT_PROGRESS_ADD = 0.05  # MIDCUT only if trail never armed and bid < entry+0.05
 MAX_MIDCUT_ATTEMPTS = 3
 POLL_SEC = 2.0
 OPEN_POLL_SEC = 0.25
@@ -172,6 +184,7 @@ def default_state() -> dict:
             "mode2_follow": 0,
             "mode2_fade": 0,
             "midcut": 0,
+            "trail": 0,
         },
         "updated_at": None,
     }
@@ -533,24 +546,43 @@ def resolve_fade_market(series: str | None = None) -> tuple[dict | None, str]:
     return None, "empty"
 
 
-def mode2_entry_allowed(age: float, *, need_prior: bool, prior_ok: bool) -> tuple[bool, float, str]:
+def mode2_ema_gap_score(trend: dict | None) -> float:
+    """Relative |EMA3-EMA9|/|EMA9| — larger = clearer FOLLOW. 0 if unavailable.
+
+    Documented Mode2 same-cycle pick: highest score wins; ties break by
+    series order BTC → ETH → SOL (caller sorts with MODE2_SERIES index).
+    """
+    if not trend:
+        return 0.0
+    e3, e9 = trend.get("ema3"), trend.get("ema9")
+    try:
+        e3f, e9f = float(e3), float(e9)
+    except (TypeError, ValueError):
+        return 0.0
+    denom = abs(e9f) if e9f else 1.0
+    return abs(e3f - e9f) / denom
+
+
+def mode2_entry_allowed(age: float, *, need_prior: bool = False, prior_ok: bool = True) -> tuple[bool, float, str]:
     """Decide if Mode2 may enter given market age.
 
-    - age <= ENTRY_MAX_AGE_SEC (20): always (normal exact-open)
-    - need_prior and not prior_ok: up to ENTRY_SETTLE_GRACE_SEC (45)
-    - 20 < age <= ENTRY_CATCHUP_MAX_AGE_SEC (60): only with transition catch-up flag
+    Confirm window only: age ∈ [ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC]
+    (60–120s). Do NOT enter at exact-open (age < 60). Listing-lag catch-up is
+    retargeted to that same window — if the market appears late but age is still
+    ≤120s (and ≥60s), entry is allowed. Outside the window: wait / skip.
+
+    need_prior / prior_ok kept for API compat (MIXED settle-grace removed).
     """
-    if age <= ENTRY_MAX_AGE_SEC:
-        return True, float(ENTRY_MAX_AGE_SEC), "normal"
-    if need_prior and not prior_ok and age <= ENTRY_SETTLE_GRACE_SEC:
-        return True, float(ENTRY_SETTLE_GRACE_SEC), "settle_grace"
-    if age <= ENTRY_CATCHUP_MAX_AGE_SEC and transition_catchup_active():
-        return True, float(ENTRY_CATCHUP_MAX_AGE_SEC), "transition_catchup"
-    # Report the effective ceiling that blocked us
-    max_age = float(ENTRY_MAX_AGE_SEC)
-    if need_prior and not prior_ok:
-        max_age = float(ENTRY_SETTLE_GRACE_SEC)
-    return False, max_age, "blocked"
+    del need_prior, prior_ok  # unused — MIXED no longer enters via settle grace
+    lo = float(ENTRY_CONFIRM_MIN_AGE_SEC)
+    hi = float(ENTRY_CONFIRM_MAX_AGE_SEC)
+    if age < lo:
+        return False, lo, "too_early"
+    if age <= hi:
+        if transition_catchup_active():
+            return True, hi, "confirm_catchup"
+        return True, hi, "confirm_window"
+    return False, hi, "blocked"
 
 
 def prior_settle_for(close_time: str, settled: list[dict]) -> dict | None:
@@ -714,8 +746,10 @@ def place_entry(
         LOGGER.info("LIVE IOC no fill %s %s", ticker, side)
         return None
     actual_cost = entry_cost(fill, fill_price)
-    if tp_price is None:
-        # Mode 2 style default if requested
+    if tactic == "fade":
+        # Mode2: no fixed TP — trailing exit; sentinel tp_price=None
+        tp_cent = None
+    elif tp_price is None:
         tp = round(min(TP_CAP, float(fill_price) + TP_ADD), 4)
         tp_cent = min(TP_CAP, math.ceil(tp * 100 - 1e-9) / 100.0)
     else:
@@ -742,6 +776,10 @@ def place_entry(
         "tp_attempts": 0,
         "midcut_attempts": 0,
         "exit_abandoned": False,
+        # Mode2 trailing state (harmless for first_phase)
+        "peak_bid": round(min(TP_CAP, float(fill_price)), 4),
+        "trail_armed": False,
+        "trail_attempts": 0,
     }
     if extra:
         pos.update(extra)
@@ -868,7 +906,7 @@ def exchange_series_open(series: str) -> bool | None:
 
 
 def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
-    """Manage a single open position for `series` (TP / MIDCUT / settle)."""
+    """Manage a single open position for `series` (trail / MIDCUT / settle)."""
     series = str(series).upper()
 
     # Already abandoned exit — just wait for settle, never spin TP
@@ -913,60 +951,88 @@ def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
                 save_state(state)
         return
 
-    # Mode 2: fixed TP entry+0.20
-    tp = float(pos.get("tp_price") or 0)
-    if bid is not None and tp > 0 and float(bid) + 1e-9 >= tp:
-        attempts = int(pos.get("tp_attempts") or 0)
-        if attempts >= MAX_TP_ATTEMPTS:
-            LOGGER.warning(
-                "TP abandon %s after %s attempts — hold to settle, clear blocking",
-                pos["ticker"], attempts,
+    # Mode 2: trailing exit (replaces fixed TP entry+0.20)
+    # Track peak bid since entry; arm after peak >= entry+0.10; exit on -0.08 from peak.
+    # Cap peak/sells at TP_CAP (0.99). MIDCUT@7.5m only if trail never armed & bid<entry+0.05.
+    entry = float(pos.get("entry_price") or 0)
+    bid_f = min(TP_CAP, float(bid))
+    peak = float(pos.get("peak_bid") or entry)
+    peak = max(peak, bid_f)
+    peak = min(TP_CAP, peak)
+    pos["peak_bid"] = round(peak, 4)
+    # Clear legacy fixed-TP so we never fire old entry+0.20 path
+    if pos.get("tp_price") is not None:
+        pos["tp_price"] = None
+
+    trail_armed = bool(pos.get("trail_armed"))
+    arm_level = entry + TRAIL_ARM_ADD
+    if not trail_armed and peak + 1e-9 >= arm_level:
+        trail_armed = True
+        pos["trail_armed"] = True
+        LOGGER.info(
+            "TRAIL ARM %s peak=%.4f >= entry+%.2f (entry=%.4f bid=%.4f)",
+            pos["ticker"], peak, TRAIL_ARM_ADD, entry, bid_f,
+        )
+
+    if trail_armed:
+        drawdown = peak - bid_f
+        if drawdown + 1e-9 >= TRAIL_DRAWDOWN:
+            attempts = int(pos.get("trail_attempts") or pos.get("tp_attempts") or 0)
+            if attempts >= MAX_TP_ATTEMPTS:
+                LOGGER.warning(
+                    "TRAIL abandon %s after %s attempts — hold to settle peak=%.4f bid=%.4f",
+                    pos["ticker"], attempts, peak, bid_f,
+                )
+                pos["exit_abandoned"] = True
+                stats = state.setdefault("stats", {})
+                stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
+                set_series_position(state, series, pos)
+                save_state(state)
+                return
+            sell_bid = min(TP_CAP, bid_f)
+            LOGGER.info(
+                "TRAIL EXIT %s bid=%.4f peak=%.4f dd=%.4f >= %.2f attempt=%s/%s",
+                pos["ticker"], sell_bid, peak, drawdown, TRAIL_DRAWDOWN,
+                attempts + 1, MAX_TP_ATTEMPTS,
             )
-            pos["exit_abandoned"] = True
-            stats = state.setdefault("stats", {})
-            stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
+            ok = close_sell(pos, sell_bid)
+            pos["trail_attempts"] = attempts + 1
+            pos["tp_attempts"] = pos["trail_attempts"]  # mirror for status
+            if ok:
+                stats = state.setdefault("stats", {})
+                stats["trail"] = int(stats.get("trail") or 0) + 1
+                set_series_position(state, series, None)
+                save_state(state)
+                return
+            if pos["trail_attempts"] >= MAX_TP_ATTEMPTS:
+                LOGGER.warning(
+                    "TRAIL abandon after failed attempts on %s — hold to settle",
+                    pos["ticker"],
+                )
+                pos["exit_abandoned"] = True
+                stats = state.setdefault("stats", {})
+                stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
             set_series_position(state, series, pos)
             save_state(state)
             return
-        LOGGER.info(
-            "TP trigger %s bid=%.4f >= tp=%.4f attempt=%s/%s",
-            pos["ticker"], float(bid), tp, attempts + 1, MAX_TP_ATTEMPTS,
-        )
-        ok = close_sell(pos, float(bid))
-        pos["tp_attempts"] = attempts + 1
-        if ok:
-            stats = state.setdefault("stats", {})
-            stats["tp"] = int(stats.get("tp") or 0) + 1
-            set_series_position(state, series, None)
-            save_state(state)
-            return
-        # failed attempt — if hit limit, abandon
-        if pos["tp_attempts"] >= MAX_TP_ATTEMPTS:
-            LOGGER.warning(
-                "TP abandon after failed attempts on %s — hold to settle",
-                pos["ticker"],
-            )
-            pos["exit_abandoned"] = True
-            stats = state.setdefault("stats", {})
-            stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
+        # Armed but still within trail — hold; skip MIDCUT
         set_series_position(state, series, pos)
         save_state(state)
         return
 
-    # Mode 2 MIDCUT: halfway into window, not at TP, bid not progressing → cut
+    # Persist peak updates even when not exiting
+    set_series_position(state, series, pos)
+    save_state(state)
+
+    # Mode 2 MIDCUT: ~7.5m, trailing never armed, bid not progressing (< entry+0.05)
     if pos.get("exit_abandoned"):
         return
     age = window_age_sec(pos.get("close_time"))
     if age is None or age < MIDCUT_AGE_SEC:
         return
-    entry = float(pos.get("entry_price") or 0)
-    tp = float(pos.get("tp_price") or 0)
-    bid_f = float(bid)
-    if tp > 0 and bid_f + 1e-9 >= tp:
-        return  # TP path should have handled; safety
     progress_floor = entry + MIDCUT_PROGRESS_ADD
     if bid_f + 1e-9 >= progress_floor:
-        return  # progressing toward TP — hold
+        return  # some progress — hold (trail may still arm later)
     attempts = int(pos.get("midcut_attempts") or 0)
     if attempts >= MAX_MIDCUT_ATTEMPTS:
         LOGGER.warning(
@@ -980,8 +1046,8 @@ def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
         save_state(state)
         return
     LOGGER.info(
-        "MIDCUT %s age=%.0fs bid=%.4f entry=%.4f tp=%.4f progress_floor=%.4f attempt=%s/%s",
-        pos["ticker"], age, bid_f, entry, tp, progress_floor,
+        "MIDCUT %s age=%.0fs bid=%.4f entry=%.4f peak=%.4f trail_armed=%s progress_floor=%.4f attempt=%s/%s",
+        pos["ticker"], age, bid_f, entry, peak, trail_armed, progress_floor,
         attempts + 1, MAX_MIDCUT_ATTEMPTS,
     )
     ok = close_sell(pos, bid_f, aggressive=True)
@@ -1118,7 +1184,12 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
 def try_enter_fade(
     state: dict, cash: float, trend: dict, series: str | None = None
 ) -> str:
-    """Mode 2: exact-open FOLLOW; skip MIXED; VWAP+ask gates. Per-series."""
+    """Mode 2: confirm-window FOLLOW (age 60–120s); skip MIXED; VWAP+ask gates.
+
+    Per-series evaluator/executor. Caller may rank series by EMA gap when
+    multiple qualify; MAX_OPEN=1 blocks new entries while any position is open
+    (existing opens are still managed elsewhere).
+    """
     series = str(series or SERIES).upper()
     label_asset = asset_label(series)
     if get_series_position(state, series):
@@ -1126,7 +1197,7 @@ def try_enter_fade(
     if cash is None or cash < 0.50:
         return f"cash too low {cash}"
     if open_position_count(state) >= MAX_OPEN:
-        return f"already at max open positions ({MAX_OPEN})"
+        return f"max concurrent open ({open_position_count(state)}/{MAX_OPEN}) — skip new entries"
 
     market, src = resolve_fade_market(series)
     if not market:
@@ -1157,24 +1228,41 @@ def try_enter_fade(
         )
         return f"skip MIXED ({series})"
 
-    # Exact-open (≤20s); transition catch-up (≤60). No MIXED settle-grace path.
-    allowed, max_age, age_path = mode2_entry_allowed(
+    # Confirm window [60, 120]s; listing-lag catch-up retargeted to same window.
+    allowed, bound_age, age_path = mode2_entry_allowed(
         age, need_prior=False, prior_ok=prior_ok
     )
     if not allowed:
+        if age_path == "too_early":
+            return (
+                f"waiting confirm window (age={age:.0f}s < {bound_age:.0f}s, "
+                f"rem={None if rem is None else round(rem)}s) on {market['ticker']}"
+            )
         return (
-            f"waiting for next open (age={age:.0f}s > {max_age:.0f}s, "
+            f"confirm window missed (age={age:.0f}s > {bound_age:.0f}s, "
             f"rem={None if rem is None else round(rem)}s) on {market['ticker']}"
         )
     if age < -2:
         return f"market not open yet age={age:.0f}s"
-    if age_path == "transition_catchup":
+    if age_path == "confirm_catchup":
         LOGGER.info(
-            "Mode2 transition catch-up %s age=%.0fs src=%s ticker=%s",
+            "Mode2 confirm catch-up %s age=%.0fs src=%s ticker=%s (window %s–%ss)",
             label_asset,
             age,
             src,
             market["ticker"],
+            ENTRY_CONFIRM_MIN_AGE_SEC,
+            ENTRY_CONFIRM_MAX_AGE_SEC,
+        )
+    else:
+        LOGGER.info(
+            "Mode2 confirm window %s age=%.0fs src=%s ticker=%s (window %s–%ss)",
+            label_asset,
+            age,
+            src,
+            market["ticker"],
+            ENTRY_CONFIRM_MIN_AGE_SEC,
+            ENTRY_CONFIRM_MAX_AGE_SEC,
         )
 
     if prior_ok:
@@ -1254,10 +1342,12 @@ def try_enter_fade(
         "filled": bool(pos),
     }
     if pos:
-        # Ensure TP is entry + 0.20
+        # Mode2 trailing: no fixed TP; ensure trail fields present
         fill_px = float(pos["entry_price"])
-        tp = round(min(TP_CAP, fill_px + TP_ADD), 4)
-        pos["tp_price"] = min(TP_CAP, math.ceil(tp * 100 - 1e-9) / 100.0)
+        pos["tp_price"] = None
+        pos["peak_bid"] = round(min(TP_CAP, fill_px), 4)
+        pos["trail_armed"] = False
+        pos.setdefault("trail_attempts", 0)
         set_series_position(state, series, pos)
         mark_traded(state, series, close_time)
         stats = state.setdefault("stats", {})
@@ -1269,7 +1359,8 @@ def try_enter_fade(
         save_state(state)
         return (
             f"ENTERED {label} {pos['ticker']} {side.upper()} @ {pos['entry_price']} "
-            f"tp={pos['tp_price']} oid={pos['order_id']}"
+            f"trail=arm+{TRAIL_ARM_ADD:.2f}/dd-{TRAIL_DRAWDOWN:.2f} "
+            f"oid={pos['order_id']}"
         )
     save_state(state)
     return f"entry attempt no fill on {market['ticker']} {side} ({label})"
@@ -1321,7 +1412,9 @@ def write_status(
         "- Markets: KXBTC15M/BTCUSDT · KXETH15M/ETHUSDT · KXSOL15M/SOLUSDT",
         "- UP → FOLLOW YES (spot>VWAP120m) · DOWN → FOLLOW NO (spot<VWAP120m) · MIXED → skip",
         "- EMA3/9 picks FOLLOW side; VWAP + ask≤0.70 gate entries; MIXED skipped",
-        "- Up to one open per series (3 max); cash re-checked before each entry",
+        "- Confirm window age∈[60,120]s (no exact-open ≤20s); listing-lag ok inside window",
+        "- Trailing exit: arm when peak≥entry+0.10; exit when bid≤peak−0.08; sell cap 0.99; no fixed TP+0.20",
+        "- Max 1 concurrent open across BTC+ETH+SOL; same-cycle pick=clearest EMA gap then BTC→ETH→SOL",
         "",
         "## Last settle",
         "",
@@ -1340,10 +1433,15 @@ def write_status(
             if not pos:
                 continue
             abandoned = " exit_abandoned=YES" if pos.get("exit_abandoned") else ""
+            trail_txt = (
+                f"peak={pos.get('peak_bid')} armed={pos.get('trail_armed')}"
+                if pos.get("tactic") == "fade" or pos.get("peak_bid") is not None
+                else f"tp={pos.get('tp_price')}"
+            )
             lines.append(
                 f"- OPEN `{pos.get('ticker')}` side=**{str(pos.get('side') or '').upper()}** "
                 f"qty={pos.get('contracts')} entry={pos.get('entry_price')} "
-                f"tp={pos.get('tp_price')} tactic={pos.get('tactic')} "
+                f"{trail_txt} tactic={pos.get('tactic')} "
                 f"label={pos.get('mode2_label') or pos.get('exit_rule') or ''} "
                 f"oid={pos.get('order_id')}{abandoned}"
             )
@@ -1355,8 +1453,8 @@ def write_status(
         "## Rules (short)",
         "",
         "- Mode 1 first_phase (BTC): rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
-        "- Mode 2 FOLLOW (BTC+ETH+SOL): exact open ≤20s; VWAP align; ask≤0.70; TP entry+20¢; MIDCUT@7.5m if bid<entry+0.05; max 3 tries",
-        "- Stake ~$1 IOC; ≤1 open per series; Ex2 cash; NEVER deposit/withdraw/bank",
+        "- Mode 2 FOLLOW (BTC+ETH+SOL): confirm age∈[60,120]s; VWAP align; ask≤0.70; trail arm+10¢ stop−8¢ from peak (cap 0.99); MIDCUT@7.5m if trail never armed & bid<entry+0.05; max 3 tries",
+        "- Stake ~$1 IOC; max 1 concurrent across series; Ex2 cash; NEVER deposit/withdraw/bank",
         "",
         "## Stats",
         "",
@@ -1554,13 +1652,19 @@ def run_loop(mode: str) -> None:
     series_list = list(MODE2_SERIES) if mode == "fade" else [SERIES]
     LOGGER.info(
         "Multi-asset terminal LIVE start mode=%s series=%s stake~$%.2f max_open=%s. "
-        "Mode2 rules per market: UP→YES/DOWN→NO FOLLOW+VWAP120m, skip MIXED, "
-        "ask≤0.70, TP entry+0.20, MIDCUT@7.5m if bid<entry+0.05, max 3 tries. "
+        "Mode2 rules per market: confirm age∈[%ss,%ss], UP→YES/DOWN→NO FOLLOW+VWAP120m, "
+        "skip MIXED, ask≤0.70, TRAIL arm+0.10/dd-0.08 (cap 0.99, no fixed TP+0.20), "
+        "MIDCUT@7.5m if trail never armed & bid<entry+0.05, max 3 tries. "
+        "Max1 concurrent across series; same-cycle pick=clearest EMA gap then BTC→ETH→SOL. "
         "Mode1: rem(50,70] any≥1¢ (BTC only). Cash-gated; no deposits.",
         mode, ",".join(series_list), STAKE, MAX_OPEN if mode == "fade" else 1,
+        ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
     )
     LOGGER.info(
-        "Mode2 markets: KXBTC15M/BTCUSDT + KXETH15M/ETHUSDT + KXSOL15M/SOLUSDT"
+        "Mode2 markets: KXBTC15M/BTCUSDT + KXETH15M/ETHUSDT + KXSOL15M/SOLUSDT | "
+        "max_concurrent_open=%s confirm_window=%s–%ss trail=arm+%.2f/dd-%.2f",
+        MAX_OPEN, ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
+        TRAIL_ARM_ADD, TRAIL_DRAWDOWN,
     )
 
     def _on_sig(_signum, _frame):
@@ -1639,35 +1743,66 @@ def run_loop(mode: str) -> None:
                         state["mode"] = mode
                         state["pid"] = os.getpid()
                 else:
+                    # Holding notes for any open (manage already ran); block NEW if max1.
                     for s in series_list:
-                        state = load_state()
-                        state["armed"] = True
-                        state["mode"] = mode
-                        state["pid"] = os.getpid()
-                        if get_series_position(state, s):
-                            pos = get_series_position(state, s)
+                        pos = get_series_position(state, s)
+                        if pos:
                             notes.append(
                                 f"holding[{asset_label(s)}] {pos['ticker']} "
                                 f"{pos['side'].upper()} entry={pos['entry_price']} "
                                 f"tp={pos.get('tp_price')}"
                             )
-                            continue
-                        # Refresh cash before each potential entry
-                        cash_now = safe_balance()
-                        if cash_now is None:
-                            notes.append(f"{s}: balance unavailable")
-                            break
-                        if cash_now < 0.50:
-                            notes.append(f"{s}: cash too low {cash_now:.4f}")
-                            break
-                        note = try_enter_fade(
-                            state, cash_now, trends.get(s) or {}, series=s
+                    n_open = open_position_count(state)
+                    if n_open >= MAX_OPEN:
+                        notes.append(
+                            f"max1 concurrent open={n_open}/{MAX_OPEN} — skip new entries"
                         )
-                        notes.append(f"[{asset_label(s)}] {note}")
-                        state = load_state()
-                        state["armed"] = True
-                        state["mode"] = mode
-                        state["pid"] = os.getpid()
+                    else:
+                        # Rank candidates: clearest EMA gap first; tie → BTC→ETH→SOL.
+                        ranked = sorted(
+                            series_list,
+                            key=lambda s: (
+                                -mode2_ema_gap_score(trends.get(s) or {}),
+                                MODE2_SERIES.index(s)
+                                if s in MODE2_SERIES
+                                else 99,
+                            ),
+                        )
+                        for s in ranked:
+                            state = load_state()
+                            state["armed"] = True
+                            state["mode"] = mode
+                            state["pid"] = os.getpid()
+                            if get_series_position(state, s):
+                                continue
+                            if open_position_count(state) >= MAX_OPEN:
+                                notes.append(
+                                    f"max1 hit after prior entry — skip remaining"
+                                )
+                                break
+                            cash_now = safe_balance()
+                            if cash_now is None:
+                                notes.append(f"{s}: balance unavailable")
+                                break
+                            if cash_now < 0.50:
+                                notes.append(f"{s}: cash too low {cash_now:.4f}")
+                                break
+                            gap = mode2_ema_gap_score(trends.get(s) or {})
+                            note = try_enter_fade(
+                                state, cash_now, trends.get(s) or {}, series=s
+                            )
+                            notes.append(
+                                f"[{asset_label(s)} gap={gap:.5f}] {note}"
+                            )
+                            state = load_state()
+                            state["armed"] = True
+                            state["mode"] = mode
+                            state["pid"] = os.getpid()
+                            # Only one new entry per cycle under max1
+                            if open_position_count(state) >= MAX_OPEN or note.startswith(
+                                "ENTERED"
+                            ):
+                                break
             else:
                 notes.append("balance unavailable")
 
@@ -1686,13 +1821,8 @@ def run_loop(mode: str) -> None:
                             mark_transition_obs()
                             sleep_for = OPEN_POLL_SEC
                         if mode == "fade":
-                            if age is not None and age <= ENTRY_SETTLE_GRACE_SEC:
-                                sleep_for = OPEN_POLL_SEC
-                            elif (
-                                age is not None
-                                and age <= ENTRY_CATCHUP_MAX_AGE_SEC
-                                and transition_catchup_active()
-                            ):
+                            # Fast poll from open through end of confirm window (0–120s)
+                            if age is not None and 0 <= age <= ENTRY_CONFIRM_MAX_AGE_SEC:
                                 sleep_for = OPEN_POLL_SEC
                             elif rem is not None and rem <= NEAR_OPEN_SEC:
                                 sleep_for = OPEN_POLL_SEC

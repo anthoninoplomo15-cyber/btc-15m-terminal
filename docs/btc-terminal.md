@@ -21,7 +21,7 @@ python -m omega.btc_terminal trend
 # Mode 1 — last ~1 minute any-gain
 LIVE=1 python -m omega.btc_terminal start --mode first_phase
 
-# Mode 2 — exact-open FOLLOW (VWAP-gated)
+# Mode 2 — confirm-window FOLLOW (age 60–120s, VWAP-gated, max1)
 LIVE=1 python -m omega.btc_terminal start --mode fade
 
 # stop (armed=false; kills btc_terminal / leftover fade_btc / omega.worker)
@@ -64,13 +64,16 @@ Advice vs a prospective side (when known): **ALIGNED** / **CONFLICT** / **CAUTIO
 
 ## Mode 2 — `fade` (FOLLOW only; MIXED skipped)
 
-Exact open of new interval:
+Confirm window after market open (multi-series BTC+ETH+SOL):
 
-- Age ≤ **20s** after open (normal)
-- **Transition catch-up:** if we observed empty open list or rem≤0 within the last **90s**,
-  allow first appearance up to age ≤ **60s** (Kalshi listing lag). In-memory flag; cleared on restart.
-- Near :00/:15/:30/:45 (±30s) keep **0.25s** poll even when open list is empty
-- Optional: construct next `KXBTC15M-…` ticker from clock and `fetch_market` when list is empty
+- Enter only when age ∈ **[60, 120]** seconds — **not** at exact-open ≤20s
+- **Listing-lag catch-up:** if we observed empty open list / rem≤0 within the last **90s**,
+  still ok as long as age is inside **[60, 120]** when the market appears (retargeted window).
+- Outside the window: wait / skip
+- Near :00/:15/:30/:45 (±30s) and through age≤120s keep **0.25s** poll
+- Optional: construct next series ticker from clock and `fetch_market` when list is empty
+- **Max concurrent open = 1** across BTC+ETH+SOL (still scan all three; if any open, skip new entries)
+- Same-cycle multi-qualify: pick **clearest EMA3/9 gap** (`|EMA3−EMA9|/|EMA9|`); ties → BTC then ETH then SOL
 
 **Direction (EMA3/9 primary + risk gates):**
 
@@ -80,15 +83,18 @@ Exact open of new interval:
 | **DOWN** | Follow → buy **NO** | spot **&lt;** VWAP120m; ask **≤ 0.70** |
 | **MIXED / SIDEWAYS** | **Skip** (log `skip MIXED`) | no fade |
 
-- **TP:** entry price **+ 0.20** (20 cents), capped at **0.99**
-- **MIDCUT:** if age into 15m window ≥ **~7.5 min** and bid has not hit TP and bid is
-  not progressing (`bid < entry + 0.05`), sell IOC aggressively (deeper ladder).
-  Log `MIDCUT`. Max **3** attempts then `exit_abandoned`.
+- **Trailing exit** (replaces fixed TP +0.20):
+  - Track **peak bid** since entry (capped at **0.99**)
+  - **Arm** when peak ≥ entry **+ 0.10**
+  - Once armed, **exit** when bid falls **≥ 0.08** from that peak (`TRAIL EXIT`)
+  - Max **3** sell attempts then `exit_abandoned`
+- **MIDCUT:** if age ≥ **~7.5 min** and trailing **never armed** and
+  `bid < entry + 0.05`, sell IOC aggressively. Log `MIDCUT`. Max **3** attempts.
 - Fast poll near open (**0.25s**)
 - **Exit retry:** max **3** TP or MIDCUT sell attempts. If all fail:
   set `exit_abandoned`, **hold to settle**.
   After settle, clear position so the **next open entry is never blocked**.
-- One open max; never spin forever on exits
+- Max **1** concurrent open across series; never spin forever on exits
 
 ## Files
 

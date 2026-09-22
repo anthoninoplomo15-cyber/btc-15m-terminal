@@ -70,39 +70,56 @@ def test_near_interval_boundary_clock():
     )
 
 
-def test_mode2_entry_allowed_normal_and_catchup(monkeypatch):
+def test_mode2_entry_allowed_confirm_window(monkeypatch):
     btc_terminal._last_transition_obs_mono = None
 
+    # exact-open / early age → too_early (do NOT enter ≤20s anymore)
     ok, mx, path = btc_terminal.mode2_entry_allowed(
         15.0, need_prior=False, prior_ok=True
     )
-    assert ok and path == "normal" and mx == 20
+    assert not ok and path == "too_early" and mx == 60
 
-    # age 46 without transition flag → blocked at 20
     ok, mx, path = btc_terminal.mode2_entry_allowed(
         46.0, need_prior=False, prior_ok=True
     )
-    assert not ok and path == "blocked" and mx == 20
+    assert not ok and path == "too_early" and mx == 60
 
-    # with transition flag → catch-up up to 60
+    # confirm window [60, 120]
+    ok, mx, path = btc_terminal.mode2_entry_allowed(
+        60.0, need_prior=False, prior_ok=True
+    )
+    assert ok and path == "confirm_window" and mx == 120
+
+    ok, mx, path = btc_terminal.mode2_entry_allowed(
+        90.0, need_prior=False, prior_ok=True
+    )
+    assert ok and path == "confirm_window" and mx == 120
+
+    # listing-lag catch-up flag still ok inside window
     btc_terminal.mark_transition_obs()
     ok, mx, path = btc_terminal.mode2_entry_allowed(
-        46.0, need_prior=False, prior_ok=True
+        110.0, need_prior=False, prior_ok=True
     )
-    assert ok and path == "transition_catchup" and mx == 60
+    assert ok and path == "confirm_catchup" and mx == 120
 
-    # age 61 even with flag → blocked
+    # age > 120 → blocked even with catch-up
     ok, mx, path = btc_terminal.mode2_entry_allowed(
-        61.0, need_prior=False, prior_ok=True
+        121.0, need_prior=False, prior_ok=True
     )
-    assert not ok and path == "blocked"
+    assert not ok and path == "blocked" and mx == 120
 
-    # MIXED settle grace still allows ≤45 without catch-up
-    btc_terminal._last_transition_obs_mono = None
-    ok, mx, path = btc_terminal.mode2_entry_allowed(
-        40.0, need_prior=True, prior_ok=False
-    )
-    assert ok and path == "settle_grace" and mx == 45
+
+def test_mode2_ema_gap_score_and_max_open():
+    assert btc_terminal.MAX_OPEN == 1
+    assert btc_terminal.ENTRY_CONFIRM_MIN_AGE_SEC == 60
+    assert btc_terminal.ENTRY_CONFIRM_MAX_AGE_SEC == 120
+    assert btc_terminal.TRAIL_ARM_ADD == 0.10
+    assert btc_terminal.TRAIL_DRAWDOWN == 0.08
+    assert btc_terminal.TP_CAP == 0.99
+    weak = {"ema3": 100.0, "ema9": 99.9}
+    strong = {"ema3": 110.0, "ema9": 100.0}
+    assert btc_terminal.mode2_ema_gap_score(strong) > btc_terminal.mode2_ema_gap_score(weak)
+    assert btc_terminal.mode2_ema_gap_score({}) == 0.0
 
 
 def test_transition_catchup_expires(monkeypatch):
