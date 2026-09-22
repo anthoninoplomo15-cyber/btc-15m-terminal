@@ -3,9 +3,11 @@
 Modes:
   first_phase — enter last ~1 min (rem in (50,70]), side from trend + cheap ask;
                 exit any ~≥1¢ net after fees, else hold to settle.
-  fade        — exact-open entry; direction from trend:
-                  UP→YES follow, DOWN→NO follow, MIXED→fade prior settle;
-                TP = entry+0.20 capped 0.99; max 3 TP sell attempts then abandon.
+  fade        — exact-open entry; EMA3/9 direction:
+                  UP→YES follow (spot>VWAP120m), DOWN→NO follow (spot<VWAP120m);
+                  MIXED/SIDEWAYS → skip; ask>0.70 → skip;
+                TP = entry+0.20 capped 0.99; midcut at ~7.5m if not progressing;
+                max 3 TP/MIDCUT sell attempts then abandon.
 
 CLI (user activates manually; default is OFF / status only):
   python -m omega.btc_terminal status
@@ -36,7 +38,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from omega import config
-from omega.btc_trend import detect_trend, format_trend_block, mode2_side_from_trend
+from omega.btc_trend import detect_trend, format_trend_block, mode2_side_from_trend, mode2_vwap_aligned
 from omega.fetch import INTERVAL_SECONDS, fetch_market, seconds_remaining, _kalshi_get
 from omega.kalshi import (
     ForbiddenEndpoint,
@@ -77,12 +79,16 @@ FP_ANY_GAIN = 0.01  # ~1¢ net after fees
 
 # Mode 2 — fade / follow
 ENTRY_MAX_AGE_SEC = 20
-ENTRY_SETTLE_GRACE_SEC = 45
+ENTRY_SETTLE_GRACE_SEC = 45  # legacy; MIXED no longer enters
 ENTRY_CATCHUP_MAX_AGE_SEC = 60  # listing-lag catch-up after empty/rem<=0
 TRANSITION_CATCHUP_LOOKBACK_SEC = 90
 TP_ADD = 0.20  # +20 cents from entry
 TP_CAP = 0.99
 MAX_TP_ATTEMPTS = 3
+MODE2_ASK_MAX = 0.70  # skip FOLLOW if chosen ask above this (harder to hit +20¢)
+MIDCUT_AGE_SEC = 450  # ~7.5 min halfway into 15m window
+MIDCUT_PROGRESS_ADD = 0.05  # bid must reach entry+0.05 to count as progressing
+MAX_MIDCUT_ATTEMPTS = 3
 POLL_SEC = 2.0
 OPEN_POLL_SEC = 0.25
 NEAR_OPEN_SEC = 30  # also ±30s of :00/:15/:30/:45 clock boundary
@@ -158,6 +164,7 @@ def default_state() -> dict:
             "exit_abandoned": 0,
             "mode2_follow": 0,
             "mode2_fade": 0,
+            "midcut": 0,
         },
         "updated_at": None,
     }
@@ -598,6 +605,7 @@ def place_entry(
         "mode": "LIVE",
         "tactic": tactic,
         "tp_attempts": 0,
+        "midcut_attempts": 0,
         "exit_abandoned": False,
     }
     if extra:
@@ -605,14 +613,23 @@ def place_entry(
     return pos
 
 
-def close_sell(position: dict, bid: float) -> bool:
-    """Sell IOC near bid. Returns True if filled."""
+def close_sell(position: dict, bid: float, *, aggressive: bool = False) -> bool:
+    """Sell IOC near bid (optional deeper ladder). Returns True if filled."""
     ticker = position["ticker"]
     side = position["side"]
     qty = float(position["contracts"])
     px = round(max(0.01, float(bid)), 2)
     prices = []
-    for p in (px, round(max(0.01, px - 0.01), 2), round(max(0.01, px - 0.02), 2)):
+    ladder = [px, round(max(0.01, px - 0.01), 2), round(max(0.01, px - 0.02), 2)]
+    if aggressive:
+        ladder.extend(
+            [
+                round(max(0.01, px - 0.05), 2),
+                round(max(0.01, px - 0.10), 2),
+                0.01,
+            ]
+        )
+    for p in ladder:
         if p not in prices:
             prices.append(p)
     for sell_px in prices:
@@ -764,6 +781,57 @@ def manage_position(state: dict, mode: str) -> None:
             stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
         state["position"] = pos
         save_state(state)
+        return
+
+    # Mode 2 MIDCUT: halfway into window, not at TP, bid not progressing → cut
+    if pos.get("exit_abandoned"):
+        return
+    age = window_age_sec(pos.get("close_time"))
+    if age is None or age < MIDCUT_AGE_SEC:
+        return
+    entry = float(pos.get("entry_price") or 0)
+    tp = float(pos.get("tp_price") or 0)
+    bid_f = float(bid)
+    if tp > 0 and bid_f + 1e-9 >= tp:
+        return  # TP path should have handled; safety
+    progress_floor = entry + MIDCUT_PROGRESS_ADD
+    if bid_f + 1e-9 >= progress_floor:
+        return  # progressing toward TP — hold
+    attempts = int(pos.get("midcut_attempts") or 0)
+    if attempts >= MAX_MIDCUT_ATTEMPTS:
+        LOGGER.warning(
+            "MIDCUT abandon %s after %s attempts — hold to settle age=%.0fs bid=%.4f entry=%.4f",
+            pos["ticker"], attempts, age, bid_f, entry,
+        )
+        pos["exit_abandoned"] = True
+        stats = state.setdefault("stats", {})
+        stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
+        state["position"] = pos
+        save_state(state)
+        return
+    LOGGER.info(
+        "MIDCUT %s age=%.0fs bid=%.4f entry=%.4f tp=%.4f progress_floor=%.4f attempt=%s/%s",
+        pos["ticker"], age, bid_f, entry, tp, progress_floor,
+        attempts + 1, MAX_MIDCUT_ATTEMPTS,
+    )
+    ok = close_sell(pos, bid_f, aggressive=True)
+    pos["midcut_attempts"] = attempts + 1
+    if ok:
+        stats = state.setdefault("stats", {})
+        stats["midcut"] = int(stats.get("midcut") or 0) + 1
+        state["position"] = None
+        save_state(state)
+        return
+    if pos["midcut_attempts"] >= MAX_MIDCUT_ATTEMPTS:
+        LOGGER.warning(
+            "MIDCUT abandon after failed attempts on %s — hold to settle",
+            pos["ticker"],
+        )
+        pos["exit_abandoned"] = True
+        stats = state.setdefault("stats", {})
+        stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
+    state["position"] = pos
+    save_state(state)
 
 
 def _record_settle(state: dict, pos: dict, result: str) -> None:
@@ -850,7 +918,7 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
 
 
 def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
-    """Mode 2: exact-open; direction from trend (FOLLOW or FADE prior)."""
+    """Mode 2: exact-open FOLLOW; skip MIXED; VWAP+ask gates."""
     if state.get("position"):
         return "already in position"
     market, src = resolve_fade_market()
@@ -876,10 +944,14 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
     prior_ok = bool(prior and prior.get("result") in {"yes", "no"})
     bias = str(trend.get("bias") or "MIXED").upper()
 
-    # Exact-open (≤20s); settle grace (≤45 MIXED); transition catch-up (≤60)
-    need_prior = bias == "MIXED"
+    # Skip MIXED/SIDEWAYS entirely — no fade
+    if bias in {"MIXED", "SIDEWAYS"}:
+        LOGGER.info("skip MIXED | age=%.0fs ticker=%s", age, market["ticker"])
+        return "skip MIXED"
+
+    # Exact-open (≤20s); transition catch-up (≤60). No MIXED settle-grace path.
     allowed, max_age, age_path = mode2_entry_allowed(
-        age, need_prior=need_prior, prior_ok=prior_ok
+        age, need_prior=False, prior_ok=prior_ok
     )
     if not allowed:
         return (
@@ -888,11 +960,6 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
         )
     if age < -2:
         return f"market not open yet age={age:.0f}s"
-    if need_prior and not prior_ok:
-        return (
-            f"at open MIXED but prior settle not ready age={age:.0f}s "
-            f"on {market['ticker']} (retrying)"
-        )
     if age_path == "transition_catchup":
         LOGGER.info(
             "Mode2 transition catch-up age=%.0fs src=%s ticker=%s",
@@ -915,17 +982,30 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
         market["ticker"],
     )
     if not side:
+        LOGGER.info("%s", label)
         return label
+
+    # VWAP alignment for FOLLOW
+    vwap_ok, vwap_msg = mode2_vwap_aligned(side, bias)
+    if not vwap_ok:
+        LOGGER.info("%s | %s", label, vwap_msg)
+        return vwap_msg
+    LOGGER.info("%s | %s", label, vwap_msg)
 
     count = exchange_open_count()
     if count is not None and count >= MAX_OPEN:
         return f"exchange already has {count} open position(s)"
 
-    # Preview ask for skip bands
+    # Preview ask for skip bands (+ Mode2 hard ask>0.70)
     ask = ask_for_side(market, side)
     if ask is not None:
         try:
-            if float(ask) > FP_ASK_MAX or float(ask) < FP_ASK_MIN:
+            ask_f = float(ask)
+            if ask_f > MODE2_ASK_MAX:
+                msg = f"skip Mode2 ask>{MODE2_ASK_MAX} {side} ask={ask}"
+                LOGGER.info(msg)
+                return msg
+            if ask_f > FP_ASK_MAX or ask_f < FP_ASK_MIN:
                 return f"skip Mode2 ask out of band {side} ask={ask}"
         except (TypeError, ValueError):
             pass
@@ -1007,8 +1087,8 @@ def write_status(
         "",
         "## Mode 2 direction rule (final)",
         "",
-        "- UP → FOLLOW YES · DOWN → FOLLOW NO · MIXED → FADE prior settle",
-        "- Trend chooses direction only — it does **not** block Mode 2 entries",
+        "- UP → FOLLOW YES (spot>VWAP120m) · DOWN → FOLLOW NO (spot<VWAP120m) · MIXED → skip",
+        "- EMA3/9 picks FOLLOW side; VWAP + ask≤0.70 gate entries; MIXED skipped",
         "",
         "## Last settle",
         "",
@@ -1039,7 +1119,7 @@ def write_status(
         "## Rules (short)",
         "",
         "- Mode 1 first_phase: rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
-        "- Mode 2 fade/follow: exact open ≤20s; TP entry+20¢ cap 0.99; max 3 TP tries then abandon",
+        "- Mode 2 FOLLOW: exact open ≤20s; VWAP align; ask≤0.70; TP entry+20¢; MIDCUT@7.5m if bid<entry+0.05; max 3 tries",
         "- Stake ~$1 IOC; one open max; Ex2 cash; NEVER deposit/withdraw/bank",
         "",
         "## Stats",
@@ -1197,7 +1277,7 @@ def run_loop(mode: str) -> None:
 
     LOGGER.info(
         "BTC terminal LIVE start mode=%s series=%s stake~$%.2f. "
-        "Mode2: UP→YES FOLLOW, DOWN→NO FOLLOW, MIXED→FADE prior. "
+        "Mode2: UP→YES/DOWN→NO FOLLOW+VWAP, skip MIXED, ask≤0.70, MIDCUT@7.5m. "
         "Mode1: rem(50,70] any≥1¢. No deposits.",
         mode, SERIES, STAKE,
     )

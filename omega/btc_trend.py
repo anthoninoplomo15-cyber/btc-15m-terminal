@@ -3,8 +3,12 @@
 Uses Binance 1m closes (via omega.fetch when available, else public klines).
 Bias: UP | DOWN | MIXED. Never places orders.
 
-Mode 2 uses bias for DIRECTION only (not a block gate):
-  UP → YES (follow), DOWN → NO (follow), MIXED → fade prior settle.
+Mode 2 direction (EMA3/9 primary):
+  UP → YES (follow) only if spot > rolling VWAP
+  DOWN → NO (follow) only if spot < rolling VWAP
+  MIXED / SIDEWAYS → skip entirely (no fade)
+
+VWAP: rolling typical-price VWAP of last VWAP_MINUTES (120) 1m bars.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ from omega.fetch import BINANCE_BASE_URL, BINANCE_SYMBOLS, fetch_binance_signal
 SERIES = "KXBTC15M"
 EMA_FAST = 3
 EMA_SLOW = 9
-LOOKBACK = 15  # 1m closes
+LOOKBACK = 15  # 1m closes for EMA bias
+# Rolling VWAP window for Mode2 FOLLOW alignment (documented choice).
+VWAP_MINUTES = 120
 
 
 def _ema(values: list[float], period: int) -> float | None:
@@ -29,7 +35,8 @@ def _ema(values: list[float], period: int) -> float | None:
     return ema
 
 
-def _fetch_closes(limit: int = LOOKBACK) -> list[float]:
+def _fetch_klines(limit: int) -> list[list]:
+    """Raw Binance 1m klines: [open_time, o, h, l, c, volume, ...]."""
     symbol = BINANCE_SYMBOLS.get(SERIES, "BTCUSDT")
     try:
         resp = requests.get(
@@ -41,28 +48,78 @@ def _fetch_closes(limit: int = LOOKBACK) -> list[float]:
         rows = resp.json()
         if not isinstance(rows, list) or len(rows) < 5:
             return []
-        return [float(c[4]) for c in rows]
+        return rows
     except Exception:
         return []
 
 
-def mode2_side_from_trend(bias: str, prior_result: str | None) -> tuple[str | None, str]:
-    """Pick Mode 2 entry side + log label from trend + prior settle.
+def _fetch_closes(limit: int = LOOKBACK) -> list[float]:
+    rows = _fetch_klines(limit)
+    if not rows:
+        return []
+    return [float(c[4]) for c in rows]
 
-    Returns (side|'yes'|'no'|None, reason_label).
+
+def compute_rolling_vwap(minutes: int = VWAP_MINUTES) -> tuple[float | None, float | None, str]:
+    """Rolling typical-price VWAP over last `minutes` of 1m bars.
+
+    VWAP = sum(((H+L+C)/3) * V) / sum(V). Spot = last close.
+    Returns (spot, vwap, note). Either may be None on failure.
     """
+    rows = _fetch_klines(minutes)
+    if not rows:
+        return None, None, "VWAP unavailable (no klines)"
+    use = rows[-minutes:] if len(rows) >= minutes else rows
+    num = 0.0
+    den = 0.0
+    for row in use:
+        try:
+            h, l, c = float(row[2]), float(row[3]), float(row[4])
+            vol = float(row[5])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if vol <= 0:
+            continue
+        typical = (h + l + c) / 3.0
+        num += typical * vol
+        den += vol
+    if den <= 0:
+        return None, None, "VWAP unavailable (zero volume)"
+    vwap = num / den
+    spot = float(use[-1][4])
+    return spot, vwap, f"spot={spot:.2f} VWAP{minutes}m={vwap:.2f} bars={len(use)}"
+
+
+def mode2_vwap_aligned(side: str, bias: str) -> tuple[bool, str]:
+    """FOLLOW VWAP gate: UP/YES needs spot>VWAP; DOWN/NO needs spot<VWAP."""
+    b = str(bias or "").upper()
+    s = str(side or "").lower()
+    spot, vwap, note = compute_rolling_vwap(VWAP_MINUTES)
+    if spot is None or vwap is None:
+        return False, f"skip VWAP unavailable ({note})"
+    if b == "UP" and s == "yes":
+        if spot > vwap:
+            return True, f"VWAP aligned UP spot>VWAP ({note})"
+        return False, f"skip VWAP misaligned UP spot<=VWAP ({note})"
+    if b == "DOWN" and s == "no":
+        if spot < vwap:
+            return True, f"VWAP aligned DOWN spot<VWAP ({note})"
+        return False, f"skip VWAP misaligned DOWN spot>=VWAP ({note})"
+    return False, f"skip VWAP unexpected side={s} bias={b}"
+
+
+def mode2_side_from_trend(bias: str, prior_result: str | None = None) -> tuple[str | None, str]:
+    """Pick Mode 2 entry side + log label from trend.
+
+    MIXED/SIDEWAYS → skip (no fade). prior_result kept for API compat, unused.
+    """
+    del prior_result  # no longer used for fade-prior
     b = str(bias or "MIXED").upper()
-    prior = str(prior_result or "").lower()
     if b == "UP":
         return "yes", "Mode2 FOLLOW UP→YES"
     if b == "DOWN":
         return "no", "Mode2 FOLLOW DOWN→NO"
-    # MIXED / SIDEWAYS → fade prior
-    if prior == "yes":
-        return "no", "Mode2 FADE prior=YES→NO"
-    if prior == "no":
-        return "yes", "Mode2 FADE prior=NO→YES"
-    return None, "Mode2 FADE waiting prior settle (MIXED)"
+    return None, "skip MIXED"
 
 
 def detect_trend(prospective_side: str | None = None) -> dict:
@@ -118,6 +175,10 @@ def detect_trend(prospective_side: str | None = None) -> dict:
             bias = "MIXED"
             parts.append("last closes bouncing → MIXED")
 
+    spot, vwap, vwap_note = compute_rolling_vwap(VWAP_MINUTES)
+    if vwap is not None and spot is not None:
+        parts.append(vwap_note)
+
     if price is not None:
         parts.insert(0, f"BTC≈{float(price):.2f}")
     if last_n:
@@ -131,7 +192,7 @@ def detect_trend(prospective_side: str | None = None) -> dict:
         advice_note = "no prospective side"
     elif bias == "MIXED":
         advice = "CAUTION"
-        advice_note = "MIXED / sideways — fade-prior path for Mode 2"
+        advice_note = "MIXED / sideways — Mode 2 skips entry"
     elif (bias == "UP" and side == "yes") or (bias == "DOWN" and side == "no"):
         advice = "ALIGNED"
         advice_note = f"trend {bias} supports {side.upper()}"
@@ -139,16 +200,16 @@ def detect_trend(prospective_side: str | None = None) -> dict:
         advice = "CONFLICT"
         advice_note = f"trend {bias} conflicts with {side.upper()}"
 
-    # Mode 2 direction preview (no block gate)
+    # Mode 2 direction preview
     if bias == "UP":
         m2_dir = "FOLLOW → YES"
-        m2_note = "Mode2 FOLLOW UP→YES (trend does not block)"
+        m2_note = "Mode2 FOLLOW UP→YES if spot>VWAP120m; else skip"
     elif bias == "DOWN":
         m2_dir = "FOLLOW → NO"
-        m2_note = "Mode2 FOLLOW DOWN→NO (trend does not block)"
+        m2_note = "Mode2 FOLLOW DOWN→NO if spot<VWAP120m; else skip"
     else:
-        m2_dir = "FADE prior settle"
-        m2_note = "Mode2 FADE prior (MIXED/SIDEWAYS) — YES→NO / NO→YES"
+        m2_dir = "SKIP MIXED"
+        m2_note = "Mode2 skip MIXED/SIDEWAYS (no fade)"
 
     return {
         "bias": bias,
@@ -160,6 +221,9 @@ def detect_trend(prospective_side: str | None = None) -> dict:
         "momentum_1m_pct": m1,
         "momentum_5m_pct": m5,
         "price": price,
+        "vwap": None if vwap is None else round(vwap, 2),
+        "vwap_spot": None if spot is None else round(spot, 2),
+        "vwap_minutes": VWAP_MINUTES,
         "closes_tail": [round(c, 2) for c in last_n],
         "mode2_direction": m2_dir,
         "mode2_note": m2_note,
@@ -173,6 +237,6 @@ def format_trend_block(trend: dict) -> list[str]:
         f"- Bias: **{trend.get('bias', 'MIXED')}**",
         f"- Note: {trend.get('note') or 'n/a'}",
         f"- Advice: **{trend.get('advice', 'CAUTION')}** — {trend.get('advice_note') or ''}",
-        f"- Mode 2 direction: **{trend.get('mode2_direction', 'FADE prior settle')}** — "
+        f"- Mode 2 direction: **{trend.get('mode2_direction', 'SKIP MIXED')}** — "
         f"{trend.get('mode2_note') or ''}",
     ]

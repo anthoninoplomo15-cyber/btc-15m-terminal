@@ -21,7 +21,7 @@ python -m omega.btc_terminal trend
 # Mode 1 — last ~1 minute any-gain
 LIVE=1 python -m omega.btc_terminal start --mode first_phase
 
-# Mode 2 — exact-open follow/fade
+# Mode 2 — exact-open FOLLOW (VWAP-gated)
 LIVE=1 python -m omega.btc_terminal start --mode fade
 
 # stop (armed=false; kills btc_terminal / leftover fade_btc / omega.worker)
@@ -32,13 +32,15 @@ Without `LIVE=1`, `start` **refuses** and exits (no paper loop).
 
 ## Trend detector
 
-Uses Binance BTCUSDT 1m closes (EMA3 vs EMA9, last closes, optional momentum).
+Uses Binance BTCUSDT 1m closes (**EMA3 vs EMA9** primary, last closes, optional momentum).
 
 | Bias | Meaning |
 |------|---------|
 | **UP** | Short EMA above slow / rising |
 | **DOWN** | Short EMA below slow / falling |
 | **MIXED** | Flat / conflicting / insufficient data |
+
+Also computes **rolling VWAP** of the last **120** 1m bars (typical price × volume).
 
 Printed on `status` / `trend` and written into `btc-terminal-status.md (or STATUS_PATH)`
 so you see bias **before** activating.
@@ -60,39 +62,40 @@ Advice vs a prospective side (when known): **ALIGNED** / **CONFLICT** / **CAUTIO
 - If no TP before settle: **hold to settle**
 - No Mode-2-style trend gate; trend only picks side
 
-## Mode 2 — `fade` (follow / fade)
+## Mode 2 — `fade` (FOLLOW only; MIXED skipped)
 
 Exact open of new interval:
 
 - Age ≤ **20s** after open (normal)
-- Settle-lag grace ≤ **45s** only when bias is MIXED and prior result not ready yet
 - **Transition catch-up:** if we observed empty open list or rem≤0 within the last **90s**,
   allow first appearance up to age ≤ **60s** (Kalshi listing lag). In-memory flag; cleared on restart.
 - Near :00/:15/:30/:45 (±30s) keep **0.25s** poll even when open list is empty
 - Optional: construct next `KXBTC15M-…` ticker from clock and `fetch_market` when list is empty
 
-**Direction (FINAL — trend does NOT block entries):**
+**Direction (EMA3/9 primary + risk gates):**
 
-| Trend bias | Action | Log label example |
-|------------|--------|-------------------|
-| **UP** | Follow → buy **YES** | `Mode2 FOLLOW UP→YES` |
-| **DOWN** | Follow → buy **NO** | `Mode2 FOLLOW DOWN→NO` |
-| **MIXED / SIDEWAYS** | Fade prior settle: YES→**NO**, NO→**YES** | `Mode2 FADE prior=NO→YES` |
+| Trend bias | Action | Gates |
+|------------|--------|-------|
+| **UP** | Follow → buy **YES** | spot **>** VWAP120m; ask **≤ 0.70** |
+| **DOWN** | Follow → buy **NO** | spot **&lt;** VWAP120m; ask **≤ 0.70** |
+| **MIXED / SIDEWAYS** | **Skip** (log `skip MIXED`) | no fade |
 
 - **TP:** entry price **+ 0.20** (20 cents), capped at **0.99**
-  (example: entry 0.917 → TP 0.99)
+- **MIDCUT:** if age into 15m window ≥ **~7.5 min** and bid has not hit TP and bid is
+  not progressing (`bid < entry + 0.05`), sell IOC aggressively (deeper ladder).
+  Log `MIDCUT`. Max **3** attempts then `exit_abandoned`.
 - Fast poll near open (**0.25s**)
-- **Exit retry:** max **3** TP sell attempts. If all fail (KalshiError / no fill):
-  set `exit_abandoned`, clear the blocking retry loop, **hold to settle**.
+- **Exit retry:** max **3** TP or MIDCUT sell attempts. If all fail:
+  set `exit_abandoned`, **hold to settle**.
   After settle, clear position so the **next open entry is never blocked**.
-- One open max; never spin forever on TP
+- One open max; never spin forever on exits
 
 ## Files
 
 | Path | Role |
 |------|------|
 | `omega/btc_terminal.py` | CLI + live loop |
-| `omega/btc_trend.py` | Trend + Mode 2 direction helper |
+| `omega/btc_trend.py` | Trend + VWAP + Mode 2 direction helper |
 | `data/btc_terminal_state.json` | armed/mode/position/stats |
 | `btc_terminal.log` | runtime log |
 | `btc-terminal-status.md (or STATUS_PATH)` | human status (shows OFF when stopped) |
@@ -101,5 +104,5 @@ Exact open of new interval:
 ## Safety
 
 - Reuses `omega.kalshi` allowlist (no deposit/withdraw/bank paths)
-- Keys: env `KALSHI_*` or `KALSHI_KEY_DIR` (never commit)
+- Keys: env `KALSHI_*` or `KALSHI_KEY_DIR` (never commit) — box default `/home/box/.kalshi`
 - Do not leave `start` running unless you intentionally armed it
