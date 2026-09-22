@@ -326,10 +326,19 @@ HTML = """<!DOCTYPE html>
     Free Render sleeps — wake via this URL. Keys: set <code>KALSHI_API_KEY_ID</code> + <code>KALSHI_PRIVATE_KEY</code> in Render env (do not commit).
   </p>
 <script>
+async function parseJson(r) {
+  const t = await r.text();
+  const trimmed = (t || '').trim();
+  if (!trimmed || trimmed[0] === '<') {
+    throw new Error('waking — retry in a few seconds');
+  }
+  try { return JSON.parse(trimmed); }
+  catch (e) { throw new Error('waking — retry in a few seconds'); }
+}
 async function refresh() {
   try {
-    const r = await fetch('/api/status');
-    const j = await r.json();
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    const j = await parseJson(r);
     const armed = !!j.armed;
     const bias = (j.trend && j.trend.bias) || 'MIXED';
     document.getElementById('armed').textContent = armed ? 'ON' : 'OFF';
@@ -359,14 +368,14 @@ async function startMode(mode) {
   document.getElementById('msg').textContent = 'starting ' + mode + '…';
   const r = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({mode})});
-  const j = await r.json();
+  const j = await parseJson(r);
   document.getElementById('msg').textContent = (j.ok ? 'OK: ' : 'ERR: ') + (j.message || JSON.stringify(j));
   refresh();
 }
 async function stopAll() {
   document.getElementById('msg').textContent = 'stopping…';
   const r = await fetch('/api/stop', {method:'POST'});
-  const j = await r.json();
+  const j = await parseJson(r);
   document.getElementById('msg').textContent = (j.ok ? 'OK: ' : 'ERR: ') + (j.message || JSON.stringify(j));
   refresh();
 }
