@@ -1,9 +1,9 @@
-"""BTC short-horizon trend for KXBTC15M terminal advice / Mode 2 direction.
+"""Short-horizon trend for Kalshi 15m crypto terminals (BTC/ETH/SOL).
 
 Uses Binance 1m closes (via omega.fetch when available, else public klines).
 Bias: UP | DOWN | MIXED. Never places orders.
 
-Mode 2 direction (EMA3/9 primary):
+Mode 2 direction (EMA3/9 primary), same rules per market:
   UP → YES (follow) only if spot > rolling VWAP
   DOWN → NO (follow) only if spot < rolling VWAP
   MIXED / SIDEWAYS → skip entirely (no fade)
@@ -17,12 +17,30 @@ import requests
 
 from omega.fetch import BINANCE_BASE_URL, BINANCE_SYMBOLS, fetch_binance_signal
 
-SERIES = "KXBTC15M"
+SERIES_DEFAULT = "KXBTC15M"
+# Back-compat alias used by older imports / status text
+SERIES = SERIES_DEFAULT
 EMA_FAST = 3
 EMA_SLOW = 9
 LOOKBACK = 15  # 1m closes for EMA bias
 # Rolling VWAP window for Mode2 FOLLOW alignment (documented choice).
 VWAP_MINUTES = 120
+
+_ASSET_LABEL = {
+    "KXBTC15M": "BTC",
+    "KXETH15M": "ETH",
+    "KXSOL15M": "SOL",
+}
+
+
+def asset_label(series: str | None = None) -> str:
+    s = str(series or SERIES_DEFAULT).upper()
+    if s in _ASSET_LABEL:
+        return _ASSET_LABEL[s]
+    # KXETH15M → ETH, etc.
+    if s.startswith("KX") and s.endswith("15M") and len(s) > 5:
+        return s[2:-3]
+    return s
 
 
 def _ema(values: list[float], period: int) -> float | None:
@@ -35,9 +53,10 @@ def _ema(values: list[float], period: int) -> float | None:
     return ema
 
 
-def _fetch_klines(limit: int) -> list[list]:
+def _fetch_klines(limit: int, series: str | None = None) -> list[list]:
     """Raw Binance 1m klines: [open_time, o, h, l, c, volume, ...]."""
-    symbol = BINANCE_SYMBOLS.get(SERIES, "BTCUSDT")
+    series = str(series or SERIES_DEFAULT).upper()
+    symbol = BINANCE_SYMBOLS.get(series, "BTCUSDT")
     try:
         resp = requests.get(
             BINANCE_BASE_URL + "/api/v3/klines",
@@ -53,20 +72,22 @@ def _fetch_klines(limit: int) -> list[list]:
         return []
 
 
-def _fetch_closes(limit: int = LOOKBACK) -> list[float]:
-    rows = _fetch_klines(limit)
+def _fetch_closes(limit: int = LOOKBACK, series: str | None = None) -> list[float]:
+    rows = _fetch_klines(limit, series=series)
     if not rows:
         return []
     return [float(c[4]) for c in rows]
 
 
-def compute_rolling_vwap(minutes: int = VWAP_MINUTES) -> tuple[float | None, float | None, str]:
+def compute_rolling_vwap(
+    minutes: int = VWAP_MINUTES, series: str | None = None
+) -> tuple[float | None, float | None, str]:
     """Rolling typical-price VWAP over last `minutes` of 1m bars.
 
     VWAP = sum(((H+L+C)/3) * V) / sum(V). Spot = last close.
     Returns (spot, vwap, note). Either may be None on failure.
     """
-    rows = _fetch_klines(minutes)
+    rows = _fetch_klines(minutes, series=series)
     if not rows:
         return None, None, "VWAP unavailable (no klines)"
     use = rows[-minutes:] if len(rows) >= minutes else rows
@@ -90,11 +111,13 @@ def compute_rolling_vwap(minutes: int = VWAP_MINUTES) -> tuple[float | None, flo
     return spot, vwap, f"spot={spot:.2f} VWAP{minutes}m={vwap:.2f} bars={len(use)}"
 
 
-def mode2_vwap_aligned(side: str, bias: str) -> tuple[bool, str]:
+def mode2_vwap_aligned(
+    side: str, bias: str, series: str | None = None
+) -> tuple[bool, str]:
     """FOLLOW VWAP gate: UP/YES needs spot>VWAP; DOWN/NO needs spot<VWAP."""
     b = str(bias or "").upper()
     s = str(side or "").lower()
-    spot, vwap, note = compute_rolling_vwap(VWAP_MINUTES)
+    spot, vwap, note = compute_rolling_vwap(VWAP_MINUTES, series=series)
     if spot is None or vwap is None:
         return False, f"skip VWAP unavailable ({note})"
     if b == "UP" and s == "yes":
@@ -122,13 +145,18 @@ def mode2_side_from_trend(bias: str, prior_result: str | None = None) -> tuple[s
     return None, "skip MIXED"
 
 
-def detect_trend(prospective_side: str | None = None) -> dict:
+def detect_trend(
+    prospective_side: str | None = None, series: str | None = None
+) -> dict:
     """Return bias / note / advice for status display and Mode 2 direction.
 
     prospective_side: 'yes' | 'no' | None — when known, advice is relative to it.
+    series: Kalshi series ticker (KXBTC15M / KXETH15M / KXSOL15M).
     """
-    closes = _fetch_closes()
-    signal = fetch_binance_signal(SERIES) or {}
+    series = str(series or SERIES_DEFAULT).upper()
+    label = asset_label(series)
+    closes = _fetch_closes(series=series)
+    signal = fetch_binance_signal(series) or {}
     m1 = signal.get("momentum_1m_pct")
     m5 = signal.get("momentum_5m_pct")
     price = signal.get("binance_price")
@@ -163,7 +191,7 @@ def detect_trend(prospective_side: str | None = None) -> dict:
         except (TypeError, ValueError):
             parts.append("momentum unavailable")
     else:
-        parts.append("insufficient BTC data → MIXED")
+        parts.append(f"insufficient {label} data → MIXED")
 
     # Soft conflict: last closes vs EMA bias → MIXED
     if last_n and len(last_n) >= 3 and bias in {"UP", "DOWN"}:
@@ -175,14 +203,27 @@ def detect_trend(prospective_side: str | None = None) -> dict:
             bias = "MIXED"
             parts.append("last closes bouncing → MIXED")
 
-    spot, vwap, vwap_note = compute_rolling_vwap(VWAP_MINUTES)
+    spot, vwap, vwap_note = compute_rolling_vwap(VWAP_MINUTES, series=series)
     if vwap is not None and spot is not None:
         parts.append(vwap_note)
 
     if price is not None:
-        parts.insert(0, f"BTC≈{float(price):.2f}")
+        try:
+            pf = float(price)
+            # SOL/ETH need more decimals than BTC for readability
+            if pf >= 1000:
+                parts.insert(0, f"{label}≈{pf:.2f}")
+            elif pf >= 10:
+                parts.insert(0, f"{label}≈{pf:.3f}")
+            else:
+                parts.insert(0, f"{label}≈{pf:.4f}")
+        except (TypeError, ValueError):
+            parts.insert(0, f"{label}≈{price}")
     if last_n:
-        parts.append("closes=" + ",".join(f"{c:.0f}" for c in last_n[-3:]))
+        if last_n[-1] >= 1000:
+            parts.append("closes=" + ",".join(f"{c:.0f}" for c in last_n[-3:]))
+        else:
+            parts.append("closes=" + ",".join(f"{c:.2f}" for c in last_n[-3:]))
 
     note = "; ".join(parts) if parts else "no data"
 
@@ -212,6 +253,8 @@ def detect_trend(prospective_side: str | None = None) -> dict:
         m2_note = "Mode2 skip MIXED/SIDEWAYS (no fade)"
 
     return {
+        "series": series,
+        "asset": label,
         "bias": bias,
         "note": note,
         "advice": advice,
@@ -233,8 +276,10 @@ def detect_trend(prospective_side: str | None = None) -> dict:
 
 def format_trend_block(trend: dict) -> list[str]:
     """Markdown / stdout lines for status."""
+    asset = trend.get("asset") or asset_label(trend.get("series"))
+    series = trend.get("series") or SERIES_DEFAULT
     return [
-        f"- Bias: **{trend.get('bias', 'MIXED')}**",
+        f"- [{asset}/{series}] Bias: **{trend.get('bias', 'MIXED')}**",
         f"- Note: {trend.get('note') or 'n/a'}",
         f"- Advice: **{trend.get('advice', 'CAUTION')}** — {trend.get('advice_note') or ''}",
         f"- Mode 2 direction: **{trend.get('mode2_direction', 'SKIP MIXED')}** — "

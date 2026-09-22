@@ -1,13 +1,14 @@
-"""Kalshi BTC 15m dual-mode terminal (KXBTC15M).
+"""Kalshi multi-asset 15m dual-mode terminal (BTC/ETH/SOL).
 
 Modes:
-  first_phase — enter last ~1 min (rem in (50,70]), side from trend + cheap ask;
+  first_phase — BTC-only; enter last ~1 min (rem in (50,70]), side from trend + cheap ask;
                 exit any ~≥1¢ net after fees, else hold to settle.
-  fade        — exact-open entry; EMA3/9 direction:
+  fade (Mode2)— multi-series BTC+ETH+SOL; exact-open entry; EMA3/9 direction per market:
                   UP→YES follow (spot>VWAP120m), DOWN→NO follow (spot<VWAP120m);
                   MIXED/SIDEWAYS → skip; ask>0.70 → skip;
                 TP = entry+0.20 capped 0.99; midcut at ~7.5m if not progressing;
                 max 3 TP/MIDCUT sell attempts then abandon.
+                Up to one open position per series (3 concurrent max). Cash-gated.
 
 CLI (user activates manually; default is OFF / status only):
   python -m omega.btc_terminal status
@@ -16,7 +17,7 @@ CLI (user activates manually; default is OFF / status only):
   LIVE=1 python -m omega.btc_terminal start --mode fade
   python -m omega.btc_terminal stop
 
-HARD LOCK: never deposit/withdraw/bank. Ex2 cash only. Stake ~$1. One open max.
+HARD LOCK: never deposit/withdraw/bank. Ex2 cash only. Stake ~$1.
 Without LIVE=1, start refuses. Default / no args: status+trend and EXIT (no loop).
 """
 
@@ -38,7 +39,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from omega import config
-from omega.btc_trend import detect_trend, format_trend_block, mode2_side_from_trend, mode2_vwap_aligned
+from omega.btc_trend import asset_label, detect_trend, format_trend_block, mode2_side_from_trend, mode2_vwap_aligned
 from omega.fetch import INTERVAL_SECONDS, fetch_market, seconds_remaining, _kalshi_get
 from omega.kalshi import (
     ForbiddenEndpoint,
@@ -51,7 +52,9 @@ from omega.kalshi import (
 )
 from omega.signal import affordable_contracts, entry_cost, net_pnl, taker_fee
 
-SERIES = "KXBTC15M"
+SERIES = "KXBTC15M"  # primary / first_phase default
+MODE2_SERIES = ("KXBTC15M", "KXETH15M", "KXSOL15M")
+ALL_SERIES = MODE2_SERIES
 ET = ZoneInfo("America/New_York")
 # Deploy-friendly paths: package root or DATA_DIR / LOG_DIR overrides.
 _PKG_ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +70,8 @@ DOCS_PATH = Path(
 ).expanduser().resolve()
 
 STAKE = 1.00
-MAX_OPEN = 1
+MAX_OPEN_PER_SERIES = 1
+MAX_OPEN = 3  # Mode2: one per series across BTC/ETH/SOL
 
 # Mode 1 — first_phase
 FP_REM_LO = 50.0  # exclusive lower
@@ -94,7 +98,7 @@ OPEN_POLL_SEC = 0.25
 NEAR_OPEN_SEC = 30  # also ±30s of :00/:15/:30/:45 clock boundary
 FP_POLL_SEC = 1.0
 
-# Month codes for KXBTC15M-{YY}{MON}{DD}{HH}{MM}-{MM} ticker construction
+# Month codes for {SERIES}-{YY}{MON}{DD}{HH}{MM}-{MM} ticker construction
 _MONTH_CODES = (
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
@@ -150,11 +154,14 @@ def default_state() -> dict:
         "armed": False,
         "mode": None,
         "pid": None,
-        "position": None,
-        "traded_close_times": [],
+        "position": None,  # legacy single-slot; mirrored from positions when exactly one
+        "positions": {},  # series -> open position dict
+        "traded_close_times": [],  # legacy BTC close_times; prefer traded_keys
+        "traded_keys": [],  # "{series}:{close_time}" per interval traded
         "last_settle": None,
         "last_entry_attempt": None,
-        "last_trend": None,
+        "last_trend": None,  # BTC primary snapshot
+        "last_trends": {},  # series -> trend snapshot
         "stats": {
             "entries": 0,
             "tp": 0,
@@ -170,13 +177,126 @@ def default_state() -> dict:
     }
 
 
+def _series_of_position(pos: dict | None) -> str | None:
+    if not pos:
+        return None
+    s = pos.get("series")
+    if s:
+        return str(s).upper()
+    ticker = str(pos.get("ticker") or "")
+    for series in ALL_SERIES:
+        if ticker.startswith(series):
+            return series
+    if ticker.startswith("KXBTC"):
+        return "KXBTC15M"
+    return None
+
+
+def migrate_state(state: dict) -> dict:
+    """Normalize single-position legacy state → positions map keyed by series."""
+    base = default_state()
+    merged = {**base, **(state or {})}
+    positions = merged.get("positions")
+    if not isinstance(positions, dict):
+        positions = {}
+    # Coerce keys to upper; drop empties
+    clean = {}
+    for k, v in positions.items():
+        if v:
+            clean[str(k).upper()] = v
+    # Legacy single position → map
+    legacy = merged.get("position")
+    if legacy:
+        series = _series_of_position(legacy) or SERIES
+        legacy = {**legacy, "series": series}
+        clean.setdefault(series, legacy)
+    merged["positions"] = clean
+    # Mirror legacy field: single open → that pos; else None (multi uses positions)
+    if len(clean) == 1:
+        merged["position"] = next(iter(clean.values()))
+    elif len(clean) == 0:
+        merged["position"] = None
+    else:
+        merged["position"] = None
+    # Migrate traded_close_times → traded_keys (assume BTC for bare close_times)
+    keys = list(merged.get("traded_keys") or [])
+    for ct in merged.get("traded_close_times") or []:
+        bare = f"{SERIES}:{ct}"
+        if bare not in keys and ct not in keys:
+            keys.append(bare)
+    # Dedup preserve order
+    seen = set()
+    uniq = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    merged["traded_keys"] = uniq[-120:]
+    if not isinstance(merged.get("last_trends"), dict):
+        merged["last_trends"] = {}
+    return merged
+
+
+def get_positions_map(state: dict) -> dict:
+    return dict((state.get("positions") or {}))
+
+
+def open_position_count(state: dict) -> int:
+    return sum(1 for v in get_positions_map(state).values() if v)
+
+
+def get_series_position(state: dict, series: str) -> dict | None:
+    return get_positions_map(state).get(str(series).upper())
+
+
+def set_series_position(state: dict, series: str, pos: dict | None) -> None:
+    series = str(series).upper()
+    positions = dict(state.get("positions") or {})
+    if pos is None:
+        positions.pop(series, None)
+    else:
+        pos = {**pos, "series": series}
+        positions[series] = pos
+    state["positions"] = positions
+    if len(positions) == 1:
+        state["position"] = next(iter(positions.values()))
+    else:
+        state["position"] = None
+
+
+def traded_key(series: str, close_time: str) -> str:
+    return f"{str(series).upper()}:{close_time}"
+
+
+def already_traded(state: dict, series: str, close_time: str) -> bool:
+    key = traded_key(series, close_time)
+    keys = set(state.get("traded_keys") or [])
+    if key in keys:
+        return True
+    # Legacy: bare close_time only blocks BTC
+    if series == SERIES and close_time in set(state.get("traded_close_times") or []):
+        return True
+    return False
+
+
+def mark_traded(state: dict, series: str, close_time: str) -> None:
+    keys = list(state.get("traded_keys") or [])
+    key = traded_key(series, close_time)
+    if key not in keys:
+        keys.append(key)
+    state["traded_keys"] = keys[-120:]
+    if series == SERIES:
+        traded = list(state.get("traded_close_times") or [])
+        if close_time not in traded:
+            traded.append(close_time)
+        state["traded_close_times"] = traded[-40:]
+
+
 def load_state() -> dict:
     if STATE_PATH.is_file():
         try:
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            base = default_state()
-            base.update(data or {})
-            return base
+            return migrate_state(data or {})
         except Exception:
             pass
     return default_state()
@@ -238,23 +358,24 @@ def _active_interval_markets(markets: list[dict], now: datetime | None = None) -
     return [item[2] for item in active]
 
 
-def list_open_btc() -> list[dict]:
+def list_open_series(series: str | None = None) -> list[dict]:
+    series = str(series or SERIES).upper()
     payload = _kalshi_get(
         "/markets",
-        params={"series_ticker": SERIES, "status": "open", "limit": 10},
+        params={"series_ticker": series, "status": "open", "limit": 10},
         timeout=10,
     )
     markets = []
     for m in payload.get("markets") or []:
         ticker = m.get("ticker") or ""
-        if not str(ticker).startswith(SERIES):
+        if not str(ticker).startswith(series):
             continue
         yes_bid = _dollars(m, "yes_bid_dollars", "yes_bid")
         yes_ask = _dollars(m, "yes_ask_dollars", "yes_ask")
         markets.append(
             {
                 "ticker": ticker,
-                "series": SERIES,
+                "series": series,
                 "title": m.get("title") or m.get("subtitle"),
                 "close_time": m.get("close_time"),
                 "status": m.get("status"),
@@ -269,10 +390,16 @@ def list_open_btc() -> list[dict]:
     return _active_interval_markets(markets)
 
 
-def list_recent_settled(limit: int = 8) -> list[dict]:
+def list_open_btc() -> list[dict]:
+    """Back-compat: open markets for primary (BTC) series."""
+    return list_open_series(SERIES)
+
+
+def list_recent_settled(limit: int = 8, series: str | None = None) -> list[dict]:
+    series = str(series or SERIES).upper()
     payload = _kalshi_get(
         "/markets",
-        params={"series_ticker": SERIES, "status": "settled", "limit": limit},
+        params={"series_ticker": series, "status": "settled", "limit": limit},
         timeout=10,
     )
     rows = list(payload.get("markets") or [])
@@ -327,8 +454,9 @@ def current_interval_close_et(now: datetime | None = None) -> datetime:
     return open_dt + timedelta(minutes=15)
 
 
-def kxbtc15m_ticker_for_close(close_et: datetime) -> str:
-    """Build KXBTC15M-{YY}{MON}{DD}{HH}{MM}-{MM} from an ET close datetime."""
+def series_ticker_for_close(close_et: datetime, series: str | None = None) -> str:
+    """Build {SERIES}-{YY}{MON}{DD}{HH}{MM}-{MM} from an ET close datetime."""
+    series = str(series or SERIES).upper()
     if close_et.tzinfo is None:
         close_et = close_et.replace(tzinfo=ET)
     else:
@@ -338,13 +466,19 @@ def kxbtc15m_ticker_for_close(close_et: datetime) -> str:
     dd = f"{close_et.day:02d}"
     hh = f"{close_et.hour:02d}"
     mm = f"{close_et.minute:02d}"
-    return f"{SERIES}-{yy}{mon}{dd}{hh}{mm}-{mm}"
+    return f"{series}-{yy}{mon}{dd}{hh}{mm}-{mm}"
 
 
-def fetch_market_by_clock() -> dict | None:
+def kxbtc15m_ticker_for_close(close_et: datetime) -> str:
+    """Back-compat BTC ticker builder."""
+    return series_ticker_for_close(close_et, SERIES)
+
+
+def fetch_market_by_clock(series: str | None = None) -> dict | None:
     """Construct current-interval ticker from clock and fetch_market (bypass open list)."""
+    series = str(series or SERIES).upper()
     close_et = current_interval_close_et()
-    ticker = kxbtc15m_ticker_for_close(close_et)
+    ticker = series_ticker_for_close(close_et, series)
     try:
         raw = fetch_market(ticker)
     except Exception as exc:
@@ -355,12 +489,12 @@ def fetch_market_by_clock() -> dict | None:
     status = str(raw.get("status") or "").lower()
     if status not in {"open", "active", ""}:
         return None
-    # Normalize to list_open_btc shape
+    # Normalize to list_open_series shape
     yes_bid = raw.get("yes_bid")
     yes_ask = raw.get("yes_ask")
     return {
         "ticker": raw["ticker"],
-        "series": SERIES,
+        "series": series,
         "title": raw.get("title"),
         "close_time": raw.get("close_time"),
         "status": raw.get("status"),
@@ -373,26 +507,27 @@ def fetch_market_by_clock() -> dict | None:
     }
 
 
-def resolve_fade_market() -> tuple[dict | None, str]:
+def resolve_fade_market(series: str | None = None) -> tuple[dict | None, str]:
     """Pick Mode2 market: open list first; on empty/rollover try clock ticker.
 
     Marks transition observation when list is empty or selected market has rem<=0.
     """
-    opens = list_open_btc()
+    series = str(series or SERIES).upper()
+    opens = list_open_series(series)
     if opens:
         market = opens[0]
         rem = seconds_remaining(market.get("close_time"))
         if rem is not None and rem <= 0:
             mark_transition_obs()
             # Stale row at boundary — try clock construct for the new interval
-            clock_m = fetch_market_by_clock()
+            clock_m = fetch_market_by_clock(series)
             if clock_m:
                 return clock_m, "clock_after_stale"
             return None, "stale_rem_le_0"
         return market, "open_list"
 
     mark_transition_obs()
-    clock_m = fetch_market_by_clock()
+    clock_m = fetch_market_by_clock(series)
     if clock_m:
         return clock_m, "clock_after_empty"
     return None, "empty"
@@ -591,7 +726,7 @@ def place_entry(
     )
     pos = {
         "ticker": ticker,
-        "series": SERIES,
+        "series": str(market.get("series") or _series_of_position({"ticker": ticker}) or SERIES).upper(),
         "side": side,
         "contracts": fill,
         "entry_price": fill_price,
@@ -679,27 +814,62 @@ def check_settled(position: dict) -> str | None:
     return None
 
 
-def exchange_open_count() -> int | None:
+def _position_ticker(p: dict) -> str:
+    return str(
+        p.get("ticker")
+        or p.get("market_ticker")
+        or (p.get("market") or {}).get("ticker")
+        or ""
+    )
+
+
+def exchange_open_count(series_filter: tuple[str, ...] | None = None) -> int | None:
+    """Count non-zero exchange positions, optionally limited to our series."""
     try:
         live_pos = get_positions()
         open_count = 0
         for p in live_pos or []:
             fp = p.get("position_fp", p.get("position"))
             try:
-                if abs(float(fp or 0)) > 1e-9:
-                    open_count += 1
+                if abs(float(fp or 0)) <= 1e-9:
+                    continue
             except (TypeError, ValueError):
-                pass
+                continue
+            if series_filter:
+                ticker = _position_ticker(p)
+                if not any(ticker.startswith(s) for s in series_filter):
+                    continue
+            open_count += 1
         return open_count
     except Exception as exc:
         LOGGER.warning("positions check failed: %s", type(exc).__name__)
         return None
 
 
-def manage_position(state: dict, mode: str) -> None:
-    pos = state.get("position")
-    if not pos:
-        return
+def exchange_series_open(series: str) -> bool | None:
+    """True if exchange already shows an open position for this series."""
+    series = str(series).upper()
+    try:
+        live_pos = get_positions()
+        for p in live_pos or []:
+            fp = p.get("position_fp", p.get("position"))
+            try:
+                if abs(float(fp or 0)) <= 1e-9:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            ticker = _position_ticker(p)
+            if ticker.startswith(series):
+                return True
+        return False
+    except Exception as exc:
+        LOGGER.warning("positions check failed: %s", type(exc).__name__)
+        return None
+
+
+def manage_one_position(state: dict, mode: str, series: str, pos: dict) -> None:
+    """Manage a single open position for `series` (TP / MIDCUT / settle)."""
+    series = str(series).upper()
 
     # Already abandoned exit — just wait for settle, never spin TP
     if pos.get("exit_abandoned"):
@@ -739,7 +909,7 @@ def manage_position(state: dict, mode: str) -> None:
             if close_sell(pos, float(bid)):
                 stats = state.setdefault("stats", {})
                 stats["any_gain"] = int(stats.get("any_gain") or 0) + 1
-                state["position"] = None
+                set_series_position(state, series, None)
                 save_state(state)
         return
 
@@ -755,7 +925,7 @@ def manage_position(state: dict, mode: str) -> None:
             pos["exit_abandoned"] = True
             stats = state.setdefault("stats", {})
             stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
-            state["position"] = pos
+            set_series_position(state, series, pos)
             save_state(state)
             return
         LOGGER.info(
@@ -767,7 +937,7 @@ def manage_position(state: dict, mode: str) -> None:
         if ok:
             stats = state.setdefault("stats", {})
             stats["tp"] = int(stats.get("tp") or 0) + 1
-            state["position"] = None
+            set_series_position(state, series, None)
             save_state(state)
             return
         # failed attempt — if hit limit, abandon
@@ -779,7 +949,7 @@ def manage_position(state: dict, mode: str) -> None:
             pos["exit_abandoned"] = True
             stats = state.setdefault("stats", {})
             stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
-        state["position"] = pos
+        set_series_position(state, series, pos)
         save_state(state)
         return
 
@@ -806,7 +976,7 @@ def manage_position(state: dict, mode: str) -> None:
         pos["exit_abandoned"] = True
         stats = state.setdefault("stats", {})
         stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
-        state["position"] = pos
+        set_series_position(state, series, pos)
         save_state(state)
         return
     LOGGER.info(
@@ -819,7 +989,7 @@ def manage_position(state: dict, mode: str) -> None:
     if ok:
         stats = state.setdefault("stats", {})
         stats["midcut"] = int(stats.get("midcut") or 0) + 1
-        state["position"] = None
+        set_series_position(state, series, None)
         save_state(state)
         return
     if pos["midcut_attempts"] >= MAX_MIDCUT_ATTEMPTS:
@@ -830,8 +1000,27 @@ def manage_position(state: dict, mode: str) -> None:
         pos["exit_abandoned"] = True
         stats = state.setdefault("stats", {})
         stats["exit_abandoned"] = int(stats.get("exit_abandoned") or 0) + 1
-    state["position"] = pos
+    set_series_position(state, series, pos)
     save_state(state)
+
+
+def manage_position(state: dict, mode: str) -> None:
+    """Manage all open positions (multi-series) or legacy single slot."""
+    positions = get_positions_map(state)
+    if positions:
+        for series, pos in list(positions.items()):
+            if not pos:
+                continue
+            manage_one_position(state, mode, series, pos)
+            state = load_state()  # refresh after each (settle may have saved)
+            state["armed"] = True  # preserve; caller re-sets pid/mode
+        return
+    # Legacy fallback
+    pos = state.get("position")
+    if not pos:
+        return
+    series = _series_of_position(pos) or SERIES
+    manage_one_position(state, mode, series, pos)
 
 
 def _record_settle(state: dict, pos: dict, result: str) -> None:
@@ -848,30 +1037,33 @@ def _record_settle(state: dict, pos: dict, result: str) -> None:
         stats["settle_losses"] = int(stats.get("settle_losses") or 0) + 1
     state["last_settle"] = {
         "ticker": pos["ticker"],
+        "series": _series_of_position(pos),
         "result": result,
         "close_time": pos.get("close_time"),
         "side": pos["side"],
         "won": won,
         "pnl": pnl,
     }
-    # Clear position so next open entry is never blocked after settle
-    state["position"] = None
+    series = _series_of_position(pos) or SERIES
+    set_series_position(state, series, None)
     save_state(state)
 
 
 def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
-    if state.get("position"):
-        return "already in position"
-    opens = list_open_btc()
+    series = SERIES
+    if get_series_position(state, series):
+        return f"already in position ({series})"
+    if cash is None or cash < 0.50:
+        return f"cash too low {cash}"
+    opens = list_open_series(series)
     if not opens:
-        return "no open KXBTC15M market"
+        return f"no open {series} market"
     market = opens[0]
     close_time = str(market.get("close_time") or "")
     rem = seconds_remaining(close_time)
     if rem is None:
         return "bad close_time"
-    traded = set(state.get("traded_close_times") or [])
-    if close_time in traded:
+    if already_traded(state, series, close_time):
         return f"already traded this interval {market['ticker']}"
     if not (rem > FP_REM_LO and rem <= FP_REM_HI):
         return (
@@ -882,9 +1074,15 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
     LOGGER.info("first_phase signal: %s bias=%s", reason, trend.get("bias"))
     if not side:
         return reason
-    count = exchange_open_count()
+    # Cap total open across tracked series
+    if open_position_count(state) >= MAX_OPEN:
+        return f"already at max open positions ({MAX_OPEN})"
+    ex = exchange_series_open(series)
+    if ex is True:
+        return f"exchange already has open {series} position"
+    count = exchange_open_count(ALL_SERIES)
     if count is not None and count >= MAX_OPEN:
-        return f"exchange already has {count} open position(s)"
+        return f"exchange already has {count} open position(s) in tracked series"
     # Mode 1: no fixed TP — use sentinel high so manage uses any-gain path
     pos = place_entry(
         market,
@@ -897,15 +1095,15 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
     state["last_entry_attempt"] = {
         "ts": utc_now().isoformat(),
         "ticker": market["ticker"],
+        "series": series,
         "side": side,
         "mode": "first_phase",
         "reason": reason,
         "filled": bool(pos),
     }
     if pos:
-        state["position"] = pos
-        traded.add(close_time)
-        state["traded_close_times"] = sorted(traded)[-40:]
+        set_series_position(state, series, pos)
+        mark_traded(state, series, close_time)
         stats = state.setdefault("stats", {})
         stats["entries"] = int(stats.get("entries") or 0) + 1
         save_state(state)
@@ -917,13 +1115,22 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
     return f"entry attempt no fill on {market['ticker']} {side}"
 
 
-def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
-    """Mode 2: exact-open FOLLOW; skip MIXED; VWAP+ask gates."""
-    if state.get("position"):
-        return "already in position"
-    market, src = resolve_fade_market()
+def try_enter_fade(
+    state: dict, cash: float, trend: dict, series: str | None = None
+) -> str:
+    """Mode 2: exact-open FOLLOW; skip MIXED; VWAP+ask gates. Per-series."""
+    series = str(series or SERIES).upper()
+    label_asset = asset_label(series)
+    if get_series_position(state, series):
+        return f"already in position ({series})"
+    if cash is None or cash < 0.50:
+        return f"cash too low {cash}"
+    if open_position_count(state) >= MAX_OPEN:
+        return f"already at max open positions ({MAX_OPEN})"
+
+    market, src = resolve_fade_market(series)
     if not market:
-        return "no open KXBTC15M market"
+        return f"no open {series} market"
     close_time = str(market.get("close_time") or "")
     age = window_age_sec(close_time)
     rem = seconds_remaining(close_time)
@@ -935,19 +1142,20 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
             f"no current active interval age={age:.0f}s rem={rem:.0f}s "
             f"on {market['ticker']}"
         )
-    traded = set(state.get("traded_close_times") or [])
-    if close_time in traded:
+    if already_traded(state, series, close_time):
         return f"already traded this interval {market['ticker']}"
 
-    settled = list_recent_settled(12)
+    settled = list_recent_settled(12, series=series)
     prior = prior_settle_for(close_time, settled)
     prior_ok = bool(prior and prior.get("result") in {"yes", "no"})
     bias = str(trend.get("bias") or "MIXED").upper()
 
     # Skip MIXED/SIDEWAYS entirely — no fade
     if bias in {"MIXED", "SIDEWAYS"}:
-        LOGGER.info("skip MIXED | age=%.0fs ticker=%s", age, market["ticker"])
-        return "skip MIXED"
+        LOGGER.info(
+            "skip MIXED | %s age=%.0fs ticker=%s", label_asset, age, market["ticker"]
+        )
+        return f"skip MIXED ({series})"
 
     # Exact-open (≤20s); transition catch-up (≤60). No MIXED settle-grace path.
     allowed, max_age, age_path = mode2_entry_allowed(
@@ -962,7 +1170,8 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
         return f"market not open yet age={age:.0f}s"
     if age_path == "transition_catchup":
         LOGGER.info(
-            "Mode2 transition catch-up age=%.0fs src=%s ticker=%s",
+            "Mode2 transition catch-up %s age=%.0fs src=%s ticker=%s",
+            label_asset,
             age,
             src,
             market["ticker"],
@@ -973,8 +1182,9 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
 
     side, label = mode2_side_from_trend(bias, (prior or {}).get("result"))
     LOGGER.info(
-        "%s | bias=%s prior=%s age=%.0fs rem=%s ticker=%s",
+        "%s | %s bias=%s prior=%s age=%.0fs rem=%s ticker=%s",
         label,
+        label_asset,
         bias,
         (prior or {}).get("result"),
         age,
@@ -983,18 +1193,21 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
     )
     if not side:
         LOGGER.info("%s", label)
-        return label
+        return f"{label} ({series})"
 
-    # VWAP alignment for FOLLOW
-    vwap_ok, vwap_msg = mode2_vwap_aligned(side, bias)
+    # VWAP alignment for FOLLOW (per series)
+    vwap_ok, vwap_msg = mode2_vwap_aligned(side, bias, series=series)
     if not vwap_ok:
-        LOGGER.info("%s | %s", label, vwap_msg)
-        return vwap_msg
-    LOGGER.info("%s | %s", label, vwap_msg)
+        LOGGER.info("%s | %s | %s", label, label_asset, vwap_msg)
+        return f"{vwap_msg} ({series})"
+    LOGGER.info("%s | %s | %s", label, label_asset, vwap_msg)
 
-    count = exchange_open_count()
+    ex = exchange_series_open(series)
+    if ex is True:
+        return f"exchange already has open {series} position"
+    count = exchange_open_count(ALL_SERIES)
     if count is not None and count >= MAX_OPEN:
-        return f"exchange already has {count} open position(s)"
+        return f"exchange already has {count} open position(s) in tracked series"
 
     # Preview ask for skip bands (+ Mode2 hard ask>0.70)
     ask = ask_for_side(market, side)
@@ -1003,12 +1216,19 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
             ask_f = float(ask)
             if ask_f > MODE2_ASK_MAX:
                 msg = f"skip Mode2 ask>{MODE2_ASK_MAX} {side} ask={ask}"
-                LOGGER.info(msg)
-                return msg
+                LOGGER.info("%s | %s", label_asset, msg)
+                return f"{msg} ({series})"
             if ask_f > FP_ASK_MAX or ask_f < FP_ASK_MIN:
-                return f"skip Mode2 ask out of band {side} ask={ask}"
+                return f"skip Mode2 ask out of band {side} ask={ask} ({series})"
         except (TypeError, ValueError):
             pass
+
+    # Re-check cash right before send (multi entries same cycle)
+    live_cash = safe_balance()
+    if live_cash is not None:
+        cash = live_cash
+    if cash < 0.50:
+        return f"cash too low pre-entry {cash}"
 
     # TP = entry + 0.20 computed after fill inside place_entry (tp_price=None)
     pos = place_entry(
@@ -1023,10 +1243,10 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
             "prior_result": (prior or {}).get("result"),
         },
     )
-    # Fix TP to entry+0.20 after fill (place_entry already does this when tp_price=None)
     state["last_entry_attempt"] = {
         "ts": utc_now().isoformat(),
         "ticker": market["ticker"],
+        "series": series,
         "side": side,
         "mode": "fade",
         "label": label,
@@ -1038,9 +1258,8 @@ def try_enter_fade(state: dict, cash: float, trend: dict) -> str:
         fill_px = float(pos["entry_price"])
         tp = round(min(TP_CAP, fill_px + TP_ADD), 4)
         pos["tp_price"] = min(TP_CAP, math.ceil(tp * 100 - 1e-9) / 100.0)
-        state["position"] = pos
-        traded.add(close_time)
-        state["traded_close_times"] = sorted(traded)[-40:]
+        set_series_position(state, series, pos)
+        mark_traded(state, series, close_time)
         stats = state.setdefault("stats", {})
         stats["entries"] = int(stats.get("entries") or 0) + 1
         if "FOLLOW" in label:
@@ -1060,35 +1279,49 @@ def write_status(
     state: dict,
     *,
     trend: dict | None = None,
+    trends: dict | None = None,
     extra: dict | None = None,
     offline: bool = False,
 ) -> None:
-    trend = trend or state.get("last_trend") or detect_trend()
-    pos = state.get("position")
+    trends = trends or state.get("last_trends") or {}
+    trend = trend or state.get("last_trend") or trends.get(SERIES) or detect_trend(series=SERIES)
+    positions = get_positions_map(state)
     cash = (extra or {}).get("cash")
     armed = bool(state.get("armed")) and not offline
     mode = state.get("mode") or (extra or {}).get("mode")
+    series_csv = ",".join(MODE2_SERIES)
     lines = [
-        "# BTC 15m Dual-Mode Terminal Status",
+        "# Multi-Asset 15m Dual-Mode Terminal Status",
         "",
         f"- Updated: {et_now().strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"- Armed: **{'ON' if armed else 'OFF'}**",
         f"- Mode: {mode or '(none — use start --mode …)'}",
+        f"- Series (Mode2): **{series_csv}**",
         f"- PID: {state.get('pid') or (os.getpid() if armed else 'n/a')}",
         f"- Cash (Ex2): {cash if cash is not None else 'n/a'}",
+        f"- Open positions: {open_position_count(state)} / {MAX_OPEN}",
         f"- Log: `{LOG_PATH}`",
         f"- State: `{STATE_PATH}`",
         "",
-        "## Trend",
+        "## Trends",
         "",
     ]
-    lines += format_trend_block(trend)
+    if trends:
+        for s in MODE2_SERIES:
+            t = trends.get(s)
+            if t:
+                lines += format_trend_block(t if "bias" in t else {"series": s, **t})
+                lines.append("")
+    else:
+        lines += format_trend_block(trend)
+        lines.append("")
     lines += [
+        "## Mode 2 direction rule (final, per market)",
         "",
-        "## Mode 2 direction rule (final)",
-        "",
+        "- Markets: KXBTC15M/BTCUSDT · KXETH15M/ETHUSDT · KXSOL15M/SOLUSDT",
         "- UP → FOLLOW YES (spot>VWAP120m) · DOWN → FOLLOW NO (spot<VWAP120m) · MIXED → skip",
         "- EMA3/9 picks FOLLOW side; VWAP + ask≤0.70 gate entries; MIXED skipped",
+        "- Up to one open per series (3 max); cash re-checked before each entry",
         "",
         "## Last settle",
         "",
@@ -1101,16 +1334,19 @@ def write_status(
         )
     else:
         lines.append("- (none yet)")
-    lines += ["", "## Position", ""]
-    if pos:
-        abandoned = " exit_abandoned=YES" if pos.get("exit_abandoned") else ""
-        lines.append(
-            f"- OPEN `{pos.get('ticker')}` side=**{str(pos.get('side') or '').upper()}** "
-            f"qty={pos.get('contracts')} entry={pos.get('entry_price')} "
-            f"tp={pos.get('tp_price')} tactic={pos.get('tactic')} "
-            f"label={pos.get('mode2_label') or pos.get('exit_rule') or ''} "
-            f"oid={pos.get('order_id')}{abandoned}"
-        )
+    lines += ["", "## Positions", ""]
+    if positions:
+        for s, pos in positions.items():
+            if not pos:
+                continue
+            abandoned = " exit_abandoned=YES" if pos.get("exit_abandoned") else ""
+            lines.append(
+                f"- OPEN `{pos.get('ticker')}` side=**{str(pos.get('side') or '').upper()}** "
+                f"qty={pos.get('contracts')} entry={pos.get('entry_price')} "
+                f"tp={pos.get('tp_price')} tactic={pos.get('tactic')} "
+                f"label={pos.get('mode2_label') or pos.get('exit_rule') or ''} "
+                f"oid={pos.get('order_id')}{abandoned}"
+            )
     else:
         wait = (extra or {}).get("wait_note") or ("OFF / flat" if not armed else "flat / waiting")
         lines.append(f"- {wait}")
@@ -1118,9 +1354,9 @@ def write_status(
         "",
         "## Rules (short)",
         "",
-        "- Mode 1 first_phase: rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
-        "- Mode 2 FOLLOW: exact open ≤20s; VWAP align; ask≤0.70; TP entry+20¢; MIDCUT@7.5m if bid<entry+0.05; max 3 tries",
-        "- Stake ~$1 IOC; one open max; Ex2 cash; NEVER deposit/withdraw/bank",
+        "- Mode 1 first_phase (BTC): rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
+        "- Mode 2 FOLLOW (BTC+ETH+SOL): exact open ≤20s; VWAP align; ask≤0.70; TP entry+20¢; MIDCUT@7.5m if bid<entry+0.05; max 3 tries",
+        "- Stake ~$1 IOC; ≤1 open per series; Ex2 cash; NEVER deposit/withdraw/bank",
         "",
         "## Stats",
         "",
@@ -1130,19 +1366,37 @@ def write_status(
     STATUS_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
-def print_status_stdout(state: dict, trend: dict) -> None:
+def print_status_stdout(state: dict, trend: dict, trends: dict | None = None) -> None:
     armed = "ON" if state.get("armed") else "OFF"
-    print(f"btc_terminal armed={armed} mode={state.get('mode') or 'n/a'} pid={state.get('pid') or 'n/a'}")
-    print(f"trend bias={trend.get('bias')} | {trend.get('note')}")
-    print(f"advice={trend.get('advice')} — {trend.get('advice_note')}")
-    print(f"mode2={trend.get('mode2_direction')} — {trend.get('mode2_note')}")
-    pos = state.get("position")
-    if pos:
-        print(
-            f"position {pos.get('ticker')} {str(pos.get('side') or '').upper()} "
-            f"entry={pos.get('entry_price')} tp={pos.get('tp_price')} "
-            f"abandoned={pos.get('exit_abandoned')}"
-        )
+    print(
+        f"btc_terminal armed={armed} mode={state.get('mode') or 'n/a'} "
+        f"pid={state.get('pid') or 'n/a'} series={','.join(MODE2_SERIES)}"
+    )
+    trends = trends or state.get("last_trends") or {}
+    if trends:
+        for s in MODE2_SERIES:
+            t = trends.get(s) or {}
+            print(
+                f"trend[{asset_label(s)}] bias={t.get('bias')} | {t.get('note')}"
+            )
+            print(
+                f"  mode2={t.get('mode2_direction')} — {t.get('mode2_note')}"
+            )
+    else:
+        print(f"trend bias={trend.get('bias')} | {trend.get('note')}")
+        print(f"advice={trend.get('advice')} — {trend.get('advice_note')}")
+        print(f"mode2={trend.get('mode2_direction')} — {trend.get('mode2_note')}")
+    positions = get_positions_map(state)
+    if positions:
+        for s, pos in positions.items():
+            if not pos:
+                continue
+            print(
+                f"position[{asset_label(s)}] {pos.get('ticker')} "
+                f"{str(pos.get('side') or '').upper()} "
+                f"entry={pos.get('entry_price')} tp={pos.get('tp_price')} "
+                f"abandoned={pos.get('exit_abandoned')}"
+            )
     else:
         print("position: none")
     print(f"status_file: {STATUS_PATH}")
@@ -1159,34 +1413,56 @@ def cmd_status() -> int:
             state["armed"] = False
             state["pid"] = None
             save_state(state)
-    trend = detect_trend()
-    state["last_trend"] = {
-        "bias": trend.get("bias"),
-        "note": trend.get("note"),
-        "mode2_direction": trend.get("mode2_direction"),
-        "ts": utc_now().isoformat(),
-    }
+    trends = {}
+    for s in MODE2_SERIES:
+        t = detect_trend(series=s)
+        trends[s] = {
+            "series": s,
+            "asset": t.get("asset"),
+            "bias": t.get("bias"),
+            "note": t.get("note"),
+            "mode2_direction": t.get("mode2_direction"),
+            "mode2_note": t.get("mode2_note"),
+            "advice": t.get("advice"),
+            "advice_note": t.get("advice_note"),
+            "ts": utc_now().isoformat(),
+        }
+    trend = detect_trend(series=SERIES)  # full BTC block for primary
+    state["last_trend"] = trends.get(SERIES)
+    state["last_trends"] = trends
     save_state(state)
-    write_status(state, trend=trend, offline=not state.get("armed"))
-    print_status_stdout(state, trend)
+    write_status(state, trend=trend, trends=trends, offline=not state.get("armed"))
+    print_status_stdout(state, trend, trends=trends)
     return 0
 
 
 def cmd_trend() -> int:
-    trend = detect_trend()
-    print(f"bias={trend.get('bias')}")
-    print(f"note={trend.get('note')}")
-    print(f"advice={trend.get('advice')} — {trend.get('advice_note')}")
-    print(f"mode2={trend.get('mode2_direction')} — {trend.get('mode2_note')}")
+    trends = {}
+    for s in MODE2_SERIES:
+        t = detect_trend(series=s)
+        print(f"[{asset_label(s)}/{s}] bias={t.get('bias')}")
+        print(f"  note={t.get('note')}")
+        print(f"  advice={t.get('advice')} — {t.get('advice_note')}")
+        print(f"  mode2={t.get('mode2_direction')} — {t.get('mode2_note')}")
+        trends[s] = {
+            "series": s,
+            "asset": t.get("asset"),
+            "bias": t.get("bias"),
+            "note": t.get("note"),
+            "mode2_direction": t.get("mode2_direction"),
+            "mode2_note": t.get("mode2_note"),
+            "ts": utc_now().isoformat(),
+        }
     state = load_state()
-    state["last_trend"] = {
-        "bias": trend.get("bias"),
-        "note": trend.get("note"),
-        "mode2_direction": trend.get("mode2_direction"),
-        "ts": utc_now().isoformat(),
-    }
+    state["last_trend"] = trends.get(SERIES)
+    state["last_trends"] = trends
     save_state(state)
-    write_status(state, trend=trend, offline=not state.get("armed"))
+    write_status(
+        state,
+        trend=detect_trend(series=SERIES),
+        trends=trends,
+        offline=not state.get("armed"),
+    )
     return 0
 
 
@@ -1275,11 +1551,16 @@ def run_loop(mode: str) -> None:
     state["pid"] = os.getpid()
     save_state(state)
 
+    series_list = list(MODE2_SERIES) if mode == "fade" else [SERIES]
     LOGGER.info(
-        "BTC terminal LIVE start mode=%s series=%s stake~$%.2f. "
-        "Mode2: UP→YES/DOWN→NO FOLLOW+VWAP, skip MIXED, ask≤0.70, MIDCUT@7.5m. "
-        "Mode1: rem(50,70] any≥1¢. No deposits.",
-        mode, SERIES, STAKE,
+        "Multi-asset terminal LIVE start mode=%s series=%s stake~$%.2f max_open=%s. "
+        "Mode2 rules per market: UP→YES/DOWN→NO FOLLOW+VWAP120m, skip MIXED, "
+        "ask≤0.70, TP entry+0.20, MIDCUT@7.5m if bid<entry+0.05, max 3 tries. "
+        "Mode1: rem(50,70] any≥1¢ (BTC only). Cash-gated; no deposits.",
+        mode, ",".join(series_list), STAKE, MAX_OPEN if mode == "fade" else 1,
+    )
+    LOGGER.info(
+        "Mode2 markets: KXBTC15M/BTCUSDT + KXETH15M/ETHUSDT + KXSOL15M/SOLUSDT"
     )
 
     def _on_sig(_signum, _frame):
@@ -1293,33 +1574,50 @@ def run_loop(mode: str) -> None:
         # honor external stop (armed=false)
         disk = load_state()
         if disk.get("armed") is False and disk.get("pid") != os.getpid():
-            # another stop cleared armed; exit
-            if not disk.get("armed"):
-                # if our pid still set, continue; else stop asked
-                pass
+            pass
         if disk.get("armed") is False and str(disk.get("pid")) != str(os.getpid()):
             LOGGER.info("armed=false on disk — exiting loop")
             break
-        # re-read stop via state flag written by stop cmd after kill — also check armed
         if not disk.get("armed") and disk.get("pid") is None:
             LOGGER.info("stop cleared armed/pid — exiting")
             break
 
         cycle += 1
         cash = safe_balance()
-        note = ""
+        notes: list[str] = []
         sleep_for = POLL_SEC
-        trend = detect_trend()
+        trends: dict = {}
+        for s in series_list:
+            try:
+                trends[s] = detect_trend(series=s)
+            except Exception as exc:
+                LOGGER.warning("trend %s failed: %s", s, type(exc).__name__)
+                trends[s] = {
+                    "series": s,
+                    "asset": asset_label(s),
+                    "bias": "MIXED",
+                    "note": f"trend error {type(exc).__name__}",
+                    "mode2_direction": "SKIP MIXED",
+                    "mode2_note": "trend unavailable",
+                }
+
         state = load_state()
         state["armed"] = True
         state["mode"] = mode
         state["pid"] = os.getpid()
-        state["last_trend"] = {
-            "bias": trend.get("bias"),
-            "note": trend.get("note"),
-            "mode2_direction": trend.get("mode2_direction"),
-            "ts": utc_now().isoformat(),
+        state["last_trends"] = {
+            s: {
+                "series": s,
+                "asset": trends[s].get("asset"),
+                "bias": trends[s].get("bias"),
+                "note": trends[s].get("note"),
+                "mode2_direction": trends[s].get("mode2_direction"),
+                "mode2_note": trends[s].get("mode2_note"),
+                "ts": utc_now().isoformat(),
+            }
+            for s in series_list
         }
+        state["last_trend"] = state["last_trends"].get(SERIES)
 
         try:
             manage_position(state, mode)
@@ -1327,28 +1625,61 @@ def run_loop(mode: str) -> None:
             state["armed"] = True
             state["mode"] = mode
             state["pid"] = os.getpid()
-            if not state.get("position"):
-                if cash is not None:
-                    if mode == "first_phase":
-                        note = try_enter_first_phase(state, cash, trend)
-                    else:
-                        note = try_enter_fade(state, cash, trend)
-                    state = load_state()
-                    state["armed"] = True
-                    state["mode"] = mode
-                    state["pid"] = os.getpid()
+
+            # Entries: Mode2 loops all series; Mode1 BTC only
+            if cash is not None:
+                if mode == "first_phase":
+                    if not get_series_position(state, SERIES):
+                        note = try_enter_first_phase(
+                            state, cash, trends.get(SERIES) or detect_trend(series=SERIES)
+                        )
+                        notes.append(note)
+                        state = load_state()
+                        state["armed"] = True
+                        state["mode"] = mode
+                        state["pid"] = os.getpid()
                 else:
-                    note = "balance unavailable"
-                try:
-                    # Clock boundary (±30s of :00/:15/:30/:45) always fast-poll
-                    # Mode2 — even when list_open is empty during Kalshi rollover.
-                    if mode == "fade" and near_interval_boundary():
-                        sleep_for = OPEN_POLL_SEC
-                    opens = list_open_btc()
-                    if not opens and mode == "fade":
-                        mark_transition_obs()
-                        sleep_for = OPEN_POLL_SEC
-                    elif opens:
+                    for s in series_list:
+                        state = load_state()
+                        state["armed"] = True
+                        state["mode"] = mode
+                        state["pid"] = os.getpid()
+                        if get_series_position(state, s):
+                            pos = get_series_position(state, s)
+                            notes.append(
+                                f"holding[{asset_label(s)}] {pos['ticker']} "
+                                f"{pos['side'].upper()} entry={pos['entry_price']} "
+                                f"tp={pos.get('tp_price')}"
+                            )
+                            continue
+                        # Refresh cash before each potential entry
+                        cash_now = safe_balance()
+                        if cash_now is None:
+                            notes.append(f"{s}: balance unavailable")
+                            break
+                        if cash_now < 0.50:
+                            notes.append(f"{s}: cash too low {cash_now:.4f}")
+                            break
+                        note = try_enter_fade(
+                            state, cash_now, trends.get(s) or {}, series=s
+                        )
+                        notes.append(f"[{asset_label(s)}] {note}")
+                        state = load_state()
+                        state["armed"] = True
+                        state["mode"] = mode
+                        state["pid"] = os.getpid()
+            else:
+                notes.append("balance unavailable")
+
+            # Poll cadence: Mode2 fast near open / catch-up / empty list
+            try:
+                if mode == "fade" and near_interval_boundary():
+                    sleep_for = OPEN_POLL_SEC
+                any_open = False
+                for s in series_list:
+                    opens = list_open_series(s)
+                    if opens:
+                        any_open = True
                         age = window_age_sec(opens[0].get("close_time"))
                         rem = seconds_remaining(opens[0].get("close_time"))
                         if rem is not None and rem <= 0 and mode == "fade":
@@ -1369,38 +1700,56 @@ def run_loop(mode: str) -> None:
                             if rem is not None and FP_REM_LO < rem <= FP_REM_HI + 15:
                                 sleep_for = FP_POLL_SEC
                     elif mode == "fade":
-                        sleep_for = OPEN_POLL_SEC
-                except Exception:
-                    if mode == "fade":
-                        sleep_for = OPEN_POLL_SEC
                         mark_transition_obs()
-            else:
-                pos = state["position"]
-                note = (
-                    f"holding {pos['ticker']} {pos['side'].upper()} "
-                    f"entry={pos['entry_price']} tp={pos.get('tp_price')} "
-                    f"tactic={pos.get('tactic')} abandoned={pos.get('exit_abandoned')}"
-                )
-                rem = seconds_remaining(pos.get("close_time"))
-                if rem is not None and rem <= NEAR_OPEN_SEC:
+                        sleep_for = OPEN_POLL_SEC
+                if mode == "fade" and not any_open:
                     sleep_for = OPEN_POLL_SEC
+            except Exception:
+                if mode == "fade":
+                    sleep_for = OPEN_POLL_SEC
+                    mark_transition_obs()
+
+            # Holding note if we only managed
+            if not notes and open_position_count(state):
+                for s, pos in get_positions_map(state).items():
+                    if not pos:
+                        continue
+                    notes.append(
+                        f"holding {pos['ticker']} {pos['side'].upper()} "
+                        f"entry={pos['entry_price']} tp={pos.get('tp_price')} "
+                        f"tactic={pos.get('tactic')} abandoned={pos.get('exit_abandoned')}"
+                    )
+                    rem = seconds_remaining(pos.get("close_time"))
+                    if rem is not None and rem <= NEAR_OPEN_SEC:
+                        sleep_for = OPEN_POLL_SEC
         except Exception as exc:
             LOGGER.exception("cycle error: %s", exc)
-            note = f"error {type(exc).__name__}"
+            notes.append(f"error {type(exc).__name__}")
 
+        note = " | ".join(notes) if notes else ""
+        bias_summary = ",".join(
+            f"{asset_label(s)}={trends.get(s, {}).get('bias')}" for s in series_list
+        )
         if cycle <= 3 or cycle % 10 == 0 or sleep_for <= OPEN_POLL_SEC:
             if cycle <= 5 or cycle % (10 if sleep_for > OPEN_POLL_SEC else 20) == 0:
                 LOGGER.info(
-                    "cycle=%s mode=%s cash=%s open=%s poll=%.2fs bias=%s %s",
+                    "cycle=%s mode=%s cash=%s open=%s/%s poll=%.2fs %s %s",
                     cycle,
                     mode,
                     None if cash is None else round(cash, 4),
-                    1 if state.get("position") else 0,
+                    open_position_count(state),
+                    MAX_OPEN if mode == "fade" else 1,
                     sleep_for,
-                    trend.get("bias"),
+                    bias_summary,
                     note,
                 )
-        write_status(state, trend=trend, extra={"cash": cash, "wait_note": note, "mode": mode})
+        primary_trend = trends.get(SERIES) or detect_trend(series=SERIES)
+        write_status(
+            state,
+            trend=primary_trend,
+            trends=trends,
+            extra={"cash": cash, "wait_note": note or "flat / waiting", "mode": mode},
+        )
         save_state(state)
         STOP.wait(sleep_for)
 

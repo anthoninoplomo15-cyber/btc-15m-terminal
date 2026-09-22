@@ -117,8 +117,9 @@ def test_transition_catchup_expires(monkeypatch):
 
 def test_resolve_fade_market_empty_marks_transition(monkeypatch):
     btc_terminal._last_transition_obs_mono = None
+    monkeypatch.setattr(btc_terminal, "list_open_series", lambda series=None: [])
     monkeypatch.setattr(btc_terminal, "list_open_btc", lambda: [])
-    monkeypatch.setattr(btc_terminal, "fetch_market_by_clock", lambda: None)
+    monkeypatch.setattr(btc_terminal, "fetch_market_by_clock", lambda series=None: None)
     market, src = btc_terminal.resolve_fade_market()
     assert market is None and src == "empty"
     assert btc_terminal.transition_catchup_active()
@@ -127,8 +128,9 @@ def test_resolve_fade_market_empty_marks_transition(monkeypatch):
 def test_resolve_fade_market_clock_fallback(monkeypatch):
     btc_terminal._last_transition_obs_mono = None
     clock = _market("KXBTC15M-26SEP212145-45", "2026-09-22T01:45:00Z")
+    monkeypatch.setattr(btc_terminal, "list_open_series", lambda series=None: [])
     monkeypatch.setattr(btc_terminal, "list_open_btc", lambda: [])
-    monkeypatch.setattr(btc_terminal, "fetch_market_by_clock", lambda: clock)
+    monkeypatch.setattr(btc_terminal, "fetch_market_by_clock", lambda series=None: clock)
     market, src = btc_terminal.resolve_fade_market()
     assert market["ticker"] == "KXBTC15M-26SEP212145-45"
     assert src == "clock_after_empty"
