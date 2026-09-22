@@ -152,3 +152,28 @@ def test_resolve_fade_market_clock_fallback(monkeypatch):
     assert market["ticker"] == "KXBTC15M-26SEP212145-45"
     assert src == "clock_after_empty"
     assert btc_terminal.transition_catchup_active()
+
+
+def test_mode2_combined_score_prefers_clear_cheap():
+    weak = {"ema3": 100.0, "ema9": 99.95, "vwap_spot": 100.0, "vwap": 99.99}
+    strong = {"ema3": 110.0, "ema9": 100.0, "vwap_spot": 110.0, "vwap": 100.0}
+    s_weak, _ = btc_terminal.mode2_combined_score(weak, 0.65)
+    s_strong, parts = btc_terminal.mode2_combined_score(strong, 0.40)
+    assert s_strong > s_weak
+    assert parts["ask_edge"] == round(btc_terminal.MODE2_ASK_MAX - 0.40, 4)
+    # Lower ask beats equal trend
+    a, _ = btc_terminal.mode2_combined_score(strong, 0.60)
+    b, _ = btc_terminal.mode2_combined_score(strong, 0.30)
+    assert b > a
+
+
+def test_refresh_mode2_series_crypto_only(monkeypatch):
+    monkeypatch.setattr(
+        btc_terminal,
+        "mode2_crypto_series",
+        lambda force=False: ["KXBTC15M", "KXETH15M", "KXXRP15M", "KXDOGE15M"],
+    )
+    got = btc_terminal.refresh_mode2_series(force=True)
+    assert got == ("KXBTC15M", "KXETH15M", "KXXRP15M", "KXDOGE15M")
+    assert btc_terminal.MAX_OPEN == 1
+    assert "KXGOLD15M" not in got

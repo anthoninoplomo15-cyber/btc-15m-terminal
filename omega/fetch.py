@@ -210,6 +210,36 @@ def enrich_fair(market: dict) -> dict:
     return market
 
 
+
+def mode2_crypto_series(force: bool = False) -> list[str]:
+    """Kalshi crypto 15m series with Binance spot/futures map.
+
+    Includes only tickers present on Kalshi *and* in BINANCE_SYMBOLS.
+    Skips metals/commodities (Pyth), FX/indices/rates (Yahoo-only), comparisons,
+    tests, and anything unmapped. Prefer majors first for status readability /
+    tie-breaks; remaining crypto alphabetically.
+    """
+    discovered = discover_15m_series(force=force)
+    crypto = []
+    for ticker in discovered:
+        t = str(ticker or "").upper()
+        if not t or t in SKIP_SERIES or t.endswith("TEST"):
+            continue
+        if t not in BINANCE_SYMBOLS:
+            continue  # metals/FX/indices/unmapped
+        if t not in crypto:
+            crypto.append(t)
+    prefer = [
+        "KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXBNB15M",
+        "KXDOGE15M", "KXADA15M", "KXBCH15M", "KXHYPE15M", "KXNEAR15M",
+        "KXTON15M", "KXZEC15M", "KXLINK15M", "KXAVAX15M", "KXLTC15M",
+        "KXDOT15M", "KXSUI15M",
+    ]
+    ranked = [t for t in prefer if t in crypto]
+    ranked.extend(sorted(t for t in crypto if t not in ranked))
+    return ranked
+
+
 def discover_15m_series(force: bool = False) -> list[str]:
     """Pull all Kalshi fifteen_min series; keep those we can price or already know."""
     global SERIES, _SERIES_REFRESHED_AT

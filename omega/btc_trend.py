@@ -1,4 +1,4 @@
-"""Short-horizon trend for Kalshi 15m crypto terminals (BTC/ETH/SOL).
+"""Short-horizon trend for Kalshi 15m crypto terminals (Binance-mapped).
 
 Uses Binance 1m closes (via omega.fetch when available, else public klines).
 Bias: UP | DOWN | MIXED. Never places orders.
@@ -15,7 +15,13 @@ from __future__ import annotations
 
 import requests
 
-from omega.fetch import BINANCE_BASE_URL, BINANCE_SYMBOLS, fetch_binance_signal
+from omega.fetch import (
+    BINANCE_BASE_URL,
+    BINANCE_FUTURES_BASE_URL,
+    BINANCE_FUTURES_SERIES,
+    BINANCE_SYMBOLS,
+    fetch_binance_signal,
+)
 
 SERIES_DEFAULT = "KXBTC15M"
 # Back-compat alias used by older imports / status text
@@ -57,9 +63,12 @@ def _fetch_klines(limit: int, series: str | None = None) -> list[list]:
     """Raw Binance 1m klines: [open_time, o, h, l, c, volume, ...]."""
     series = str(series or SERIES_DEFAULT).upper()
     symbol = BINANCE_SYMBOLS.get(series, "BTCUSDT")
+    futures = series in BINANCE_FUTURES_SERIES
+    base = BINANCE_FUTURES_BASE_URL if futures else BINANCE_BASE_URL
+    path = "/fapi/v1/klines" if futures else "/api/v3/klines"
     try:
         resp = requests.get(
-            BINANCE_BASE_URL + "/api/v3/klines",
+            base + path,
             params={"symbol": symbol, "interval": "1m", "limit": max(limit, 12)},
             timeout=8,
         )

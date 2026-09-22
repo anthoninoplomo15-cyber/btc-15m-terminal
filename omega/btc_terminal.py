@@ -1,17 +1,19 @@
-"""Kalshi multi-asset 15m dual-mode terminal (BTC/ETH/SOL).
+"""Kalshi multi-asset 15m dual-mode terminal (all Binance-mapped crypto).
 
 Modes:
   first_phase — BTC-only; enter last ~1 min (rem in (50,70]), side from trend + cheap ask;
                 exit any ~≥1¢ net after fees, else hold to settle.
-  fade (Mode2)— multi-series BTC+ETH+SOL; confirm-window entry (age 60–120s);
+  fade (Mode2)— all Kalshi crypto 15m with Binance spot/futures map (skip metals/FX/indices/
+                  unmapped); confirm-window entry (age 60–120s);
                   EMA3/9 direction per market:
                   UP→YES follow (spot>VWAP120m), DOWN→NO follow (spot<VWAP120m);
                   MIXED/SIDEWAYS → skip; ask>0.70 → skip;
                 trailing exit (arm +0.10 peak, stop −0.08 from peak, cap 0.99);
                 midcut at ~7.5m if trail never armed and bid<entry+0.05;
                 max 3 TP/MIDCUT sell attempts then abandon.
-                Max 1 concurrent open across BTC+ETH+SOL (still scan all three).
-                Same-cycle multi-qualify → clearest EMA gap, then BTC→ETH→SOL.
+                Max 1 concurrent open across all series (still scan all).
+                Same-cycle: pick ONLY the single best by combined score
+                (EMA gap + VWAP alignment strength + lower ask).
                 Cash-gated.
 
 CLI (user activates manually; default is OFF / status only):
@@ -44,7 +46,7 @@ from zoneinfo import ZoneInfo
 
 from omega import config
 from omega.btc_trend import asset_label, detect_trend, format_trend_block, mode2_side_from_trend, mode2_vwap_aligned
-from omega.fetch import INTERVAL_SECONDS, fetch_market, seconds_remaining, _kalshi_get
+from omega.fetch import INTERVAL_SECONDS, fetch_market, mode2_crypto_series, seconds_remaining, _kalshi_get
 from omega.kalshi import (
     ForbiddenEndpoint,
     KalshiError,
@@ -57,8 +59,22 @@ from omega.kalshi import (
 from omega.signal import affordable_contracts, entry_cost, net_pnl, taker_fee
 
 SERIES = "KXBTC15M"  # primary / first_phase default
-MODE2_SERIES = ("KXBTC15M", "KXETH15M", "KXSOL15M")
-ALL_SERIES = MODE2_SERIES
+# Seed; refreshed via refresh_mode2_series() from Kalshi∩Binance crypto map.
+MODE2_SERIES: tuple[str, ...] = ("KXBTC15M", "KXETH15M", "KXSOL15M")
+ALL_SERIES: tuple[str, ...] = MODE2_SERIES
+
+
+def refresh_mode2_series(force: bool = False) -> tuple[str, ...]:
+    """Reload Mode2 universe: all Kalshi crypto 15m with Binance map (skip non-crypto)."""
+    global MODE2_SERIES, ALL_SERIES
+    try:
+        found = mode2_crypto_series(force=force)
+    except Exception:
+        found = []
+    if found:
+        MODE2_SERIES = tuple(found)
+        ALL_SERIES = MODE2_SERIES
+    return MODE2_SERIES
 ET = ZoneInfo("America/New_York")
 # Deploy-friendly paths: package root or DATA_DIR / LOG_DIR overrides.
 _PKG_ROOT = Path(__file__).resolve().parents[1]
@@ -547,11 +563,7 @@ def resolve_fade_market(series: str | None = None) -> tuple[dict | None, str]:
 
 
 def mode2_ema_gap_score(trend: dict | None) -> float:
-    """Relative |EMA3-EMA9|/|EMA9| — larger = clearer FOLLOW. 0 if unavailable.
-
-    Documented Mode2 same-cycle pick: highest score wins; ties break by
-    series order BTC → ETH → SOL (caller sorts with MODE2_SERIES index).
-    """
+    """Relative |EMA3-EMA9|/|EMA9| — larger = clearer FOLLOW. 0 if unavailable."""
     if not trend:
         return 0.0
     e3, e9 = trend.get("ema3"), trend.get("ema9")
@@ -561,6 +573,52 @@ def mode2_ema_gap_score(trend: dict | None) -> float:
         return 0.0
     denom = abs(e9f) if e9f else 1.0
     return abs(e3f - e9f) / denom
+
+
+def mode2_vwap_strength(trend: dict | None) -> float:
+    """Relative |spot−VWAP|/VWAP from trend snapshot. 0 if unavailable."""
+    if not trend:
+        return 0.0
+    spot, vwap = trend.get("vwap_spot"), trend.get("vwap")
+    try:
+        sf, vf = float(spot), float(vwap)
+    except (TypeError, ValueError):
+        return 0.0
+    if vf == 0:
+        return 0.0
+    return abs(sf - vf) / abs(vf)
+
+
+def mode2_combined_score(
+    trend: dict | None, ask: float | None
+) -> tuple[float, dict]:
+    """Mode2 best-pick score across series (higher = better).
+
+    Formula (documented):
+      score = 1000*ema_gap + 500*vwap_strength + ask_edge
+      ema_gap       = |EMA3−EMA9|/|EMA9|
+      vwap_strength = |spot−VWAP120m|/VWAP120m
+      ask_edge      = max(0, MODE2_ASK_MAX − ask)   # lower ask wins
+
+    Ties broken by MODE2_SERIES order (BTC majors first).
+    Returns (score, parts dict for logging).
+    """
+    gap = mode2_ema_gap_score(trend)
+    vwap_rel = mode2_vwap_strength(trend)
+    try:
+        ask_f = float(ask)
+    except (TypeError, ValueError):
+        ask_f = float(MODE2_ASK_MAX)
+    ask_edge = max(0.0, float(MODE2_ASK_MAX) - ask_f)
+    score = (1000.0 * gap) + (500.0 * vwap_rel) + ask_edge
+    parts = {
+        "ema_gap": round(gap, 8),
+        "vwap_strength": round(vwap_rel, 8),
+        "ask": None if ask is None else round(ask_f, 4),
+        "ask_edge": round(ask_edge, 4),
+        "score": round(score, 6),
+    }
+    return score, parts
 
 
 def mode2_entry_allowed(age: float, *, need_prior: bool = False, prior_ok: bool = True) -> tuple[bool, float, str]:
@@ -1181,14 +1239,87 @@ def try_enter_first_phase(state: dict, cash: float, trend: dict) -> str:
     return f"entry attempt no fill on {market['ticker']} {side}"
 
 
+def evaluate_mode2_candidate(
+    state: dict, trend: dict, series: str
+) -> dict | None:
+    """Return a Mode2 entry candidate dict if series qualifies now, else None.
+
+    Does NOT place orders. Used to rank all series and pick a single best.
+    Keys: series, ticker, side, label, ask, score, score_parts, market, age, bias.
+    """
+    series = str(series or SERIES).upper()
+    if get_series_position(state, series):
+        return None
+    if open_position_count(state) >= MAX_OPEN:
+        return None
+
+    market, src = resolve_fade_market(series)
+    if not market:
+        return None
+    close_time = str(market.get("close_time") or "")
+    age = window_age_sec(close_time)
+    rem = seconds_remaining(close_time)
+    if age is None or rem is None:
+        return None
+    if rem <= 0 or age < 0 or age > INTERVAL_SECONDS:
+        return None
+    if already_traded(state, series, close_time):
+        return None
+
+    bias = str(trend.get("bias") or "MIXED").upper()
+    if bias in {"MIXED", "SIDEWAYS"}:
+        return None
+
+    allowed, _bound, age_path = mode2_entry_allowed(age, need_prior=False, prior_ok=True)
+    if not allowed:
+        return None
+
+    side, label = mode2_side_from_trend(bias, None)
+    if not side:
+        return None
+
+    vwap_ok, vwap_msg = mode2_vwap_aligned(side, bias, series=series)
+    if not vwap_ok:
+        return None
+
+    ask = ask_for_side(market, side)
+    if ask is None:
+        return None
+    try:
+        ask_f = float(ask)
+    except (TypeError, ValueError):
+        return None
+    if ask_f > MODE2_ASK_MAX or ask_f > FP_ASK_MAX or ask_f < FP_ASK_MIN:
+        return None
+
+    score, parts = mode2_combined_score(trend, ask_f)
+    return {
+        "series": series,
+        "ticker": market["ticker"],
+        "side": side,
+        "label": label,
+        "ask": ask_f,
+        "score": score,
+        "score_parts": parts,
+        "market": market,
+        "age": age,
+        "rem": rem,
+        "bias": bias,
+        "age_path": age_path,
+        "src": src,
+        "vwap_msg": vwap_msg,
+        "close_time": close_time,
+    }
+
+
 def try_enter_fade(
     state: dict, cash: float, trend: dict, series: str | None = None
 ) -> str:
     """Mode 2: confirm-window FOLLOW (age 60–120s); skip MIXED; VWAP+ask gates.
 
-    Per-series evaluator/executor. Caller may rank series by EMA gap when
-    multiple qualify; MAX_OPEN=1 blocks new entries while any position is open
-    (existing opens are still managed elsewhere).
+    Per-series executor. Caller picks the single best via mode2_combined_score
+    across all crypto series; MAX_OPEN=1 blocks new entries while any position
+    is open (existing opens are still managed elsewhere).
     """
     series = str(series or SERIES).upper()
     label_asset = asset_label(series)
@@ -1409,12 +1540,13 @@ def write_status(
     lines += [
         "## Mode 2 direction rule (final, per market)",
         "",
-        "- Markets: KXBTC15M/BTCUSDT · KXETH15M/ETHUSDT · KXSOL15M/SOLUSDT",
+        f"- Markets ({len(MODE2_SERIES)} crypto): " + ",".join(MODE2_SERIES),
         "- UP → FOLLOW YES (spot>VWAP120m) · DOWN → FOLLOW NO (spot<VWAP120m) · MIXED → skip",
         "- EMA3/9 picks FOLLOW side; VWAP + ask≤0.70 gate entries; MIXED skipped",
         "- Confirm window age∈[60,120]s (no exact-open ≤20s); listing-lag ok inside window",
         "- Trailing exit: arm when peak≥entry+0.10; exit when bid≤peak−0.08; sell cap 0.99; no fixed TP+0.20",
-        "- Max 1 concurrent open across BTC+ETH+SOL; same-cycle pick=clearest EMA gap then BTC→ETH→SOL",
+        "- Max 1 concurrent open; same-cycle pick=ONLY best score "
+        "(1000*ema_gap + 500*vwap_strength + ask_edge); skip metals/FX/indices/unmapped",
         "",
         "## Last settle",
         "",
@@ -1453,8 +1585,8 @@ def write_status(
         "## Rules (short)",
         "",
         "- Mode 1 first_phase (BTC): rem∈(50,70], side from trend+cheap ask, any ≥1¢ net exit",
-        "- Mode 2 FOLLOW (BTC+ETH+SOL): confirm age∈[60,120]s; VWAP align; ask≤0.70; trail arm+10¢ stop−8¢ from peak (cap 0.99); MIDCUT@7.5m if trail never armed & bid<entry+0.05; max 3 tries",
-        "- Stake ~$1 IOC; max 1 concurrent across series; Ex2 cash; NEVER deposit/withdraw/bank",
+        "- Mode 2 FOLLOW (all Binance crypto 15m): confirm age∈[60,120]s; VWAP align; ask≤0.70; trail arm+10¢ stop−8¢ from peak (cap 0.99); MIDCUT@7.5m if trail never armed & bid<entry+0.05; max 3 tries",
+        "- Stake ~$1 IOC; max 1 concurrent; best-score pick; Ex2 cash; NEVER deposit/withdraw/bank",
         "",
         "## Stats",
         "",
@@ -1501,6 +1633,7 @@ def print_status_stdout(state: dict, trend: dict, trends: dict | None = None) ->
 
 
 def cmd_status() -> int:
+    refresh_mode2_series()
     state = load_state()
     # If marked armed but process gone, show OFF
     pid = state.get("pid")
@@ -1535,6 +1668,7 @@ def cmd_status() -> int:
 
 
 def cmd_trend() -> int:
+    refresh_mode2_series()
     trends = {}
     for s in MODE2_SERIES:
         t = detect_trend(series=s)
@@ -1649,20 +1783,25 @@ def run_loop(mode: str) -> None:
     state["pid"] = os.getpid()
     save_state(state)
 
-    series_list = list(MODE2_SERIES) if mode == "fade" else [SERIES]
+    if mode == "fade":
+        series_list = list(refresh_mode2_series(force=True))
+    else:
+        series_list = [SERIES]
     LOGGER.info(
         "Multi-asset terminal LIVE start mode=%s series=%s stake~$%.2f max_open=%s. "
         "Mode2 rules per market: confirm age∈[%ss,%ss], UP→YES/DOWN→NO FOLLOW+VWAP120m, "
         "skip MIXED, ask≤0.70, TRAIL arm+0.10/dd-0.08 (cap 0.99, no fixed TP+0.20), "
         "MIDCUT@7.5m if trail never armed & bid<entry+0.05, max 3 tries. "
-        "Max1 concurrent across series; same-cycle pick=clearest EMA gap then BTC→ETH→SOL. "
+        "Max1 concurrent; same-cycle pick=ONLY best score "
+        "(1000*ema_gap + 500*vwap_strength + ask_edge). "
         "Mode1: rem(50,70] any≥1¢ (BTC only). Cash-gated; no deposits.",
         mode, ",".join(series_list), STAKE, MAX_OPEN if mode == "fade" else 1,
         ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
     )
     LOGGER.info(
-        "Mode2 markets: KXBTC15M/BTCUSDT + KXETH15M/ETHUSDT + KXSOL15M/SOLUSDT | "
+        "Mode2 crypto universe (%s): %s | score=1000*ema_gap+500*vwap_rel+ask_edge | "
         "max_concurrent_open=%s confirm_window=%s–%ss trail=arm+%.2f/dd-%.2f",
+        len(series_list), ",".join(series_list),
         MAX_OPEN, ENTRY_CONFIRM_MIN_AGE_SEC, ENTRY_CONFIRM_MAX_AGE_SEC,
         TRAIL_ARM_ADD, TRAIL_DRAWDOWN,
     )
@@ -1687,6 +1826,8 @@ def run_loop(mode: str) -> None:
             break
 
         cycle += 1
+        if mode == "fade" and cycle % 50 == 1:
+            series_list = list(refresh_mode2_series(force=False))
         cash = safe_balance()
         notes: list[str] = []
         sleep_for = POLL_SEC
@@ -1758,51 +1899,79 @@ def run_loop(mode: str) -> None:
                             f"max1 concurrent open={n_open}/{MAX_OPEN} — skip new entries"
                         )
                     else:
-                        # Rank candidates: clearest EMA gap first; tie → BTC→ETH→SOL.
-                        ranked = sorted(
-                            series_list,
-                            key=lambda s: (
-                                -mode2_ema_gap_score(trends.get(s) or {}),
-                                MODE2_SERIES.index(s)
-                                if s in MODE2_SERIES
-                                else 99,
-                            ),
-                        )
-                        for s in ranked:
-                            state = load_state()
-                            state["armed"] = True
-                            state["mode"] = mode
-                            state["pid"] = os.getpid()
+                        # Evaluate ALL series; pick ONLY the single best by combined score.
+                        candidates = []
+                        for s in series_list:
                             if get_series_position(state, s):
                                 continue
-                            if open_position_count(state) >= MAX_OPEN:
-                                notes.append(
-                                    f"max1 hit after prior entry — skip remaining"
-                                )
-                                break
-                            cash_now = safe_balance()
-                            if cash_now is None:
-                                notes.append(f"{s}: balance unavailable")
-                                break
-                            if cash_now < 0.50:
-                                notes.append(f"{s}: cash too low {cash_now:.4f}")
-                                break
-                            gap = mode2_ema_gap_score(trends.get(s) or {})
-                            note = try_enter_fade(
-                                state, cash_now, trends.get(s) or {}, series=s
+                            cand = evaluate_mode2_candidate(
+                                state, trends.get(s) or {}, s
+                            )
+                            if cand:
+                                candidates.append(cand)
+                        if not candidates:
+                            bias_bits = ",".join(
+                                f"{asset_label(s)}={trends.get(s, {}).get('bias')}"
+                                for s in series_list[:6]
                             )
                             notes.append(
-                                f"[{asset_label(s)} gap={gap:.5f}] {note}"
+                                f"no Mode2 qualify across {len(series_list)} crypto "
+                                f"({bias_bits}…)"
                             )
-                            state = load_state()
-                            state["armed"] = True
-                            state["mode"] = mode
-                            state["pid"] = os.getpid()
-                            # Only one new entry per cycle under max1
-                            if open_position_count(state) >= MAX_OPEN or note.startswith(
-                                "ENTERED"
-                            ):
-                                break
+                        else:
+                            candidates.sort(
+                                key=lambda c: (
+                                    -float(c["score"]),
+                                    MODE2_SERIES.index(c["series"])
+                                    if c["series"] in MODE2_SERIES
+                                    else 99,
+                                )
+                            )
+                            best = candidates[0]
+                            parts = best.get("score_parts") or {}
+                            LOGGER.info(
+                                "Mode2 BEST %s score=%.4f ema_gap=%.6f vwap=%.6f "
+                                "ask=%.4f ask_edge=%.4f side=%s ticker=%s "
+                                "candidates=%s",
+                                best["series"],
+                                best["score"],
+                                parts.get("ema_gap") or 0,
+                                parts.get("vwap_strength") or 0,
+                                parts.get("ask") or 0,
+                                parts.get("ask_edge") or 0,
+                                best["side"],
+                                best["ticker"],
+                                [
+                                    f"{c['series']}:{c['score']:.4f}"
+                                    for c in candidates
+                                ],
+                            )
+                            notes.append(
+                                f"BEST[{asset_label(best['series'])} "
+                                f"score={best['score']:.4f} "
+                                f"ask={best['ask']:.2f}] "
+                                f"among {len(candidates)} qualify"
+                            )
+                            cash_now = safe_balance()
+                            if cash_now is None:
+                                notes.append("balance unavailable pre-best-entry")
+                            elif cash_now < 0.50:
+                                notes.append(f"cash too low pre-best-entry {cash_now:.4f}")
+                            else:
+                                note = try_enter_fade(
+                                    state,
+                                    cash_now,
+                                    trends.get(best["series"]) or {},
+                                    series=best["series"],
+                                )
+                                notes.append(
+                                    f"[{asset_label(best['series'])} "
+                                    f"score={best['score']:.4f}] {note}"
+                                )
+                                state = load_state()
+                                state["armed"] = True
+                                state["mode"] = mode
+                                state["pid"] = os.getpid()
             else:
                 notes.append("balance unavailable")
 

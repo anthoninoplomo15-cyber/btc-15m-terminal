@@ -64,7 +64,7 @@ Advice vs a prospective side (when known): **ALIGNED** / **CONFLICT** / **CAUTIO
 
 ## Mode 2 — `fade` (FOLLOW only; MIXED skipped)
 
-Confirm window after market open (multi-series BTC+ETH+SOL):
+Confirm window after market open (all Kalshi crypto 15m with Binance map; skip metals/FX/indices/unmapped):
 
 - Enter only when age ∈ **[60, 120]** seconds — **not** at exact-open ≤20s
 - **Listing-lag catch-up:** if we observed empty open list / rem≤0 within the last **90s**,
@@ -72,8 +72,8 @@ Confirm window after market open (multi-series BTC+ETH+SOL):
 - Outside the window: wait / skip
 - Near :00/:15/:30/:45 (±30s) and through age≤120s keep **0.25s** poll
 - Optional: construct next series ticker from clock and `fetch_market` when list is empty
-- **Max concurrent open = 1** across BTC+ETH+SOL (still scan all three; if any open, skip new entries)
-- Same-cycle multi-qualify: pick **clearest EMA3/9 gap** (`|EMA3−EMA9|/|EMA9|`); ties → BTC then ETH then SOL
+- **Max concurrent open = 1** across all crypto series (still scan all; if any open, skip new entries)
+- Same-cycle multi-qualify: pick **ONLY the single best** by score `1000*ema_gap + 500*vwap_strength + ask_edge` where `ema_gap=|EMA3−EMA9|/|EMA9|`, `vwap_strength=|spot−VWAP|/VWAP`, `ask_edge=max(0, 0.70−ask)`; ties → MODE2_SERIES order (majors first). Log winner + score.
 
 **Direction (EMA3/9 primary + risk gates):**
 
